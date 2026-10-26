@@ -1,0 +1,297 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * SISTEMA DE TEMA — dois produtos, não uma inversão.
+ *
+ * Todo token de cor é uma variável em CANAIS RGB (ex.: `7 11 20`), consumida no
+ * tailwind.config como `rgb(var(--x) / <alpha-value>)`. Isso preserva o
+ * modificador de opacidade do Tailwind (`bg-bg/50`, `border-linha/60`) nos dois
+ * modos, e faz cada componente existente herdar o tema sem tocar em uma linha —
+ * eles já usam os nomes de token (bg, ink, superficie, linha, marca-*).
+ *
+ * `:root` é o modo CLARO (base). `.dark` sobrescreve para o ESCURO. O html
+ * nasce com `.dark` (ver o script anti-FOUC no layout), então o padrão é o
+ * escuro premium que já era a identidade.
+ *
+ * ESTES BLOCOS FICAM FORA DE `@layer base` DE PROPÓSITO. Dentro de um @layer, o
+ * Tailwind faz tree-shaking de seletores de classe que não aparecem no
+ * conteúdo — e `.dark` é aplicada via JS (`classList.add`), nunca como
+ * `className="dark"` no JSX. Dentro do layer, o bloco `.dark` inteiro era
+ * PURGADO do CSS final (o `:root` sobrevivia por não ser classe), e o tema
+ * escuro simplesmente não existia. Fora do layer, nada é purgado.
+ *
+ * `vidro` fica translúcido de propósito: é a superfície de vidro cujo blur
+ * precisa deixar o fundo aparecer. Só ele.
+ */
+:root {
+  --font-display: 'Space Grotesk', system-ui, sans-serif;
+  --font-body: 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* ── CLARO — clean, luxuoso, alto contraste, nada lavado ── */
+  color-scheme: light;
+
+  --bg: 246 248 252;          /* off-white, nunca branco puro no fundo */
+  --bg-2: 255 255 255;        /* cards sobem em branco puro */
+  --bg-3: 240 244 250;
+
+  --ink: 15 23 42;            /* slate-900 — texto principal, 16:1 sobre bg */
+  --ink-2: 51 65 85;          /* slate-700 */
+  --muted: 100 116 139;       /* slate-500 — 4.6:1 sobre bg */
+  --muted-2: 118 132 156;
+
+  --superficie: 248 250 252;  /* realce sutil sobre o card branco */
+  --superficie-2: 241 245 249;
+  --linha: 226 232 240;       /* divisor delicado (slate-200) */
+  --linha-2: 203 213 225;
+
+  --vidro: 255 255 255 / 0.72;
+
+  /* Marca — mesma alma nos dois modos. No claro, o azul base é levemente mais
+     fundo para contraste de texto sobre branco. */
+  --marca-azul: 59 92 240;
+  --marca-azul-2: 42 74 214;
+  --marca-ciano: 8 145 178;   /* cyan-600: legível sobre branco */
+  --marca-violeta: 124 58 237;/* violet-600 */
+  --marca-ouro: 176 138 60;
+
+  --aurora-1: 99 102 241;
+  --aurora-2: 139 92 246;
+  --aurora-3: 34 211 238;
+  --aurora-4: 59 130 246;
+
+  --ok: 22 163 74;            /* green-600 sobre branco */
+  --alerta: 217 119 6;        /* amber-600 */
+  --erro: 220 38 38;          /* red-600 */
+
+  /* Sombras delicadas de dia — luz vinda de cima, nada de preto pesado. */
+  --sombra-cartao: 0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 24px -12px rgba(15, 23, 42, 0.12);
+  --sombra-elevado: 0 2px 4px rgba(15, 23, 42, 0.05), 0 24px 56px -20px rgba(15, 23, 42, 0.18);
+  --sombra-vidro: 0 1px 0 0 rgba(255, 255, 255, 0.9) inset, 0 8px 30px -14px rgba(15, 23, 42, 0.16);
+  --glow-marca: 0 0 32px -14px rgba(59, 92, 240, 0.45);
+  /* Halos do fundo: quase imperceptíveis no claro. */
+  --halo-1: rgba(124, 58, 237, 0.05);
+  --halo-2: rgba(8, 145, 178, 0.05);
+}
+
+.dark {
+  /* ── ESCURO — profundidade, glass, glow, azul/ciano/violeta ── */
+  color-scheme: dark;
+
+  --bg: 7 11 20;              /* #070B14 — nunca preto absoluto */
+  --bg-2: 11 16 32;           /* #0B1020 */
+  --bg-3: 14 19 37;           /* #0E1325 */
+
+  --ink: 234 240 251;         /* #EAF0FB */
+  --ink-2: 170 183 211;       /* #AAB7D3 */
+  --muted: 144 155 187;       /* #909BBB */
+  --muted-2: 125 136 166;     /* #7D88A6 */
+
+  --superficie: 19 26 47;     /* superfície elevada, opaca e sutil */
+  --superficie-2: 27 35 60;
+  --linha: 32 42 70;          /* linha sutil sobre o quase-preto */
+  --linha-2: 46 58 92;
+
+  --vidro: 16 24 46 / 0.55;
+
+  --marca-azul: 79 124 255;   /* #4F7CFF */
+  --marca-azul-2: 58 92 240;  /* #3A5CF0 */
+  --marca-ciano: 38 213 238;  /* #26D5EE */
+  --marca-violeta: 139 92 255;/* #8B5CFF */
+  --marca-ouro: 200 162 76;   /* #C8A24C */
+
+  --aurora-1: 99 102 241;
+  --aurora-2: 139 92 246;
+  --aurora-3: 34 211 238;
+  --aurora-4: 59 130 246;
+
+  --ok: 34 197 94;
+  --alerta: 245 158 11;
+  --erro: 239 68 68;
+
+  /* Sombras profundas de noite, com realce de topo (o "inset" que dá o vidro). */
+  --sombra-cartao: 0 8px 30px -12px rgba(0, 0, 0, 0.6);
+  --sombra-elevado: 0 24px 60px -20px rgba(0, 0, 0, 0.85), inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
+  --sombra-vidro: 0 8px 32px -8px rgba(0, 0, 0, 0.7), inset 0 1px 0 0 rgba(255, 255, 255, 0.06);
+  --glow-marca: 0 0 40px -12px rgba(79, 124, 255, 0.55);
+  --halo-1: rgba(139, 92, 255, 0.09);
+  --halo-2: rgba(38, 213, 238, 0.08);
+}
+
+@layer base {
+  html {
+    /* A troca de tema anima o que é barato animar — cor, não layout. */
+    transition: background-color 0.4s ease;
+  }
+
+  body {
+    @apply bg-bg text-ink font-body antialiased;
+    background-image:
+      radial-gradient(60rem 30rem at 12% -10%, var(--halo-1), transparent 60%),
+      radial-gradient(50rem 26rem at 105% 8%, var(--halo-2), transparent 60%);
+    background-attachment: fixed;
+    transition: background-color 0.4s ease, color 0.4s ease;
+  }
+
+  ::selection {
+    @apply bg-marca-azul/30 text-ink;
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-marca-ciano/70 ring-offset-2 ring-offset-bg;
+  }
+
+  ::-webkit-scrollbar {
+    @apply h-2 w-2;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-linha-2;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  /* Quem pediu menos movimento recebe menos movimento. */
+  @media (prefers-reduced-motion: reduce) {
+    html, body, * {
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* Cartão de vidro: base de quase toda a interface, agora ciente do tema. */
+  .cartao {
+    @apply rounded border border-linha bg-vidro shadow-cartao backdrop-blur-xl;
+  }
+
+  .rotulo {
+    @apply text-[11px] font-medium uppercase tracking-[0.14em] text-muted;
+  }
+
+  .texto-marca {
+    @apply bg-marca bg-clip-text text-transparent;
+  }
+
+  .num {
+    @apply font-mono tabular-nums;
+  }
+
+  /* ── Documentos legais ──
+     O reset do Tailwind zera marcador e recuo de <ul>, e uma política de
+     privacidade sem lista visível vira parágrafo corrido que ninguém termina de
+     ler. Escopo fechado em `.legal` para não ressuscitar bullets no resto da
+     interface, que depende do reset. */
+  .legal ul {
+    @apply mt-2 list-disc space-y-2 pl-5 marker:text-muted-2;
+  }
+
+  .legal strong {
+    @apply font-semibold text-ink;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   IMPRESSÃO — a folha da proposta
+   
+   O painel inteiro é escuro por padrão. Sem este bloco, imprimir a
+   proposta gastaria um cartucho de tinta por página e sairia com a
+   barra lateral, o cabeçalho e os botões no meio do documento que o
+   escritório entrega ao titular.
+   ═══════════════════════════════════════════════════════════════ */
+@media print {
+  /* Os tokens são sobrescritos DENTRO do seletor do tema escuro também:
+     no `:root` sozinho, o tema escuro venceria por especificidade e a
+     folha sairia com fundo preto — que a impressora tenta reproduzir. */
+  :root,
+  :root[data-theme='dark'],
+  .dark {
+    --bg: #ffffff;
+    --superficie: #ffffff;
+    --superficie-2: #ffffff;
+    --ink: #000000;
+    --ink-2: #1a1a1a;
+    --muted: #555555;
+    --muted-2: #777777;
+    --linha: #cccccc;
+    --linha-2: #999999;
+  }
+
+  /* Tudo que é navegação some: o documento é a única coisa na folha. */
+  aside,
+  header[class*='sticky'],
+  nav,
+  .sem-impressao {
+    display: none !important;
+  }
+
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+
+  /* O painel usa altura de viewport e rolagem interna; na folha isso
+     cortaria o conteúdo na primeira página. */
+  main,
+  .folha {
+    overflow: visible !important;
+    height: auto !important;
+    max-width: none !important;
+    padding: 0 !important;
+  }
+
+  /* Um bloco rachado entre duas páginas — o de assinatura, sobretudo —
+     é o defeito clássico de folha impressa. */
+  .bloco-folha {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  @page {
+    margin: 18mm 16mm;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   A JAZIDA DIGITAL — tokens da landing comercial, e SÓ dela.
+
+   A landing abandonou o tema duplo e assumiu o escuro como
+   identidade (decisão aprovada em 20/08/2026): dados brutos são um
+   breu, e a página é escura porque o assunto é fundo. O PAINEL não
+   entra nisso — estes tokens vivem sob `.tema-jazida`, que só a
+   página raiz veste. Os nomes vêm do conceito, não da cor: trocar
+   o tom do ouro não deve exigir renomear classe nenhuma.
+   ═══════════════════════════════════════════════════════════════ */
+.tema-jazida {
+  --abismo: #050810;      /* fundo — a profundidade */
+  --estrato: #0b1220;     /* cartões — uma camada acima */
+  --estrato-2: #101a2e;
+  --linha-j: rgba(148, 163, 199, 0.14);
+  --texto-j: #e8edf8;     /* 15:1 sobre o abismo */
+  --bruma: #939ebc;       /* secundário — ≥ 7:1 */
+  --bruma-2: #5e6a8a;
+  --sonda: #2ad4e8;       /* ciano: a varredura, a tecnologia */
+  --veio: #4f7cff;        /* azul da marca: o achado. Gasto com avareza. */
+
+  background: var(--abismo);
+  color: var(--texto-j);
+}
+
+.tema-jazida ::selection { background: rgba(79, 124, 255, 0.28); }
+
+/* Prosa JUSTIFICADA em todo o site comercial (pedido do dono, 21/08/2026).
+   Escopo por classe, nunca global: o painel tem listas e formulários onde
+   justificar viraria rios de espaço. Títulos, botões e rótulos mono não são
+   <p> e ficam de fora sozinhos. */
+.tema-jazida p { text-align: justify; }
+.legal p { text-align: justify; }
+
+/* O aviso de cookies entra de baixo, uma vez. `motion-safe` no componente
+   garante que quem pediu menos movimento o vê simplesmente aparecer. */
+@keyframes subir {
+  from { transform: translateY(16px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}

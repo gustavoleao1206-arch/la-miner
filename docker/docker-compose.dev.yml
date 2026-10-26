@@ -1,0 +1,58 @@
+# Compose de DESENVOLVIMENTO.
+#
+# ⚠ Duas correções de segurança, apontadas pela auditoria:
+#
+# 1. As portas ficam presas a 127.0.0.1. Sem o prefixo, o Docker publica em
+#    0.0.0.0 — qualquer máquina da rede (café, coworking, Wi-Fi de escritório)
+#    alcançava o Postgres. E este banco não é de brinquedo: o seed carrega
+#    `dados/carteira.xlsx`, com CPF, telefone e endereço de 3.974 pessoas reais.
+#
+# 2. As senhas não têm mais default. Antes eram `miner_dev` e `redis_dev`,
+#    publicadas neste próprio arquivo versionado — ou seja, quem alcançasse a
+#    porta já tinha a credencial. O `${VAR:?}` faz o compose FALHAR se a variável
+#    não existir, em vez de subir com um valor conhecido.
+#
+# Para acessar de fora do host (raro, e só em dev), sobrescreva o bind com uma
+# variável — não apague o prefixo daqui.
+name: miner-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: miner-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?defina POSTGRES_USER no .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+      POSTGRES_DB: ${POSTGRES_DB:?defina POSTGRES_DB no .env}
+    ports:
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: miner-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?defina REDIS_PASSWORD no .env}
+    ports:
+      # O Redis persiste (`--appendonly`) payloads { cpf, pessoaId } em claro:
+      # exposto na rede, é a base de CPFs servida sem autenticação forte.
+      - "${REDIS_BIND:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:

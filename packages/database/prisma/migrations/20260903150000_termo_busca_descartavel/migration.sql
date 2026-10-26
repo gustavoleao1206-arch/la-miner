@@ -1,0 +1,24 @@
+-- ═══════════════════════════════════════════════════════════════════
+--  O TERMO DE BUSCA PASSA A SER DESCARTÁVEL
+--  03/09/2026
+-- ═══════════════════════════════════════════════════════════════════
+--
+-- ⚠ ESCRITA À MÃO, e precisa continuar assim: `prisma migrate diff` propõe
+-- derrubar os índices trigram da busca por nome.
+--
+-- `consultas_cliente.termo` guarda a string CRUA que o operador digitou. Numa
+-- busca por nome ela É um nome completo; numa busca por endereço, um logradouro.
+-- Era o único campo desta trilha sem prazo nenhum: sobrevivia à anonimização do
+-- cliente e sobrevivia ao pedido de exclusão do titular.
+--
+-- A coluna passa a aceitar NULO para que a retenção agendada possa descartar o
+-- CONTEÚDO mantendo a LINHA. O que sustenta a prestação de contas — quem
+-- consultou, quando, qual CPF, quantos resultados, se o contato foi exibido —
+-- não tem prazo e continua inteiro. É a mesma fronteira já aplicada ao IP, ao
+-- user agent e à linha crua da planilha: some o conteúdo, fica o fato.
+--
+-- Nada é apagado AQUI. Esta migration só abre a possibilidade; quem descarta é
+-- o cron das 03:30, respeitando `RETENCAO_TERMO_BUSCA_DIAS`. Separar as duas
+-- coisas é deliberado: uma migration que apagasse dado em massa no deploy não
+-- teria como ser conferida antes.
+ALTER TABLE "consultas_cliente" ALTER COLUMN "termo" DROP NOT NULL;

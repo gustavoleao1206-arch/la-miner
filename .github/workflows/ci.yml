@@ -1,0 +1,214 @@
+# Portão de qualidade. Sem ele, 223 testes existiam e nada os executava — e
+# dependências com vulnerabilidade alta chegavam ao deploy sem nenhuma barreira.
+#
+# A ordem é do mais barato para o mais caro: tipos falham em segundos, os testes
+# de integração levam um minuto. Quem quebra o build descobre rápido.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: miner
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: miner
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U miner"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Banco efêmero do runner. A suíte de integração DERIVA a URL de teste
+      # trocando o nome do banco por <nome>_test e se recusa a rodar contra
+      # qualquer coisa que não termine em _test — a trava continua valendo aqui.
+      DATABASE_URL: postgresql://miner:ci@localhost:5432/miner?schema=public
+      JWT_ACCESS_SECRET: ci-somente-para-testes-com-32-caracteres-ok
+      JWT_REFRESH_SECRET: ci-outro-segredo-para-testes-com-32-chars
+      # Sem ela, o MfaService recusa cifrar e os testes de integração do segundo
+      # fator morrem em 503 — "MFA não está configurado neste ambiente".
+      #
+      # Faltava desde a etapa C4, e ninguém soube: o passo dos testes de unidade
+      # falhava antes, então a integração NUNCA rodou nesta CI. Consertar o
+      # portão foi o que revelou esta segunda quebra, escondida atrás da
+      # primeira.
+      #
+      # Valor fixo e público de propósito: é um runner efêmero, o banco morre
+      # junto com a job, e nenhum segredo real deve viver num arquivo
+      # versionado. A chave DE VERDADE mora no cofre da Render — e perdê-la
+      # apaga o MFA de todo mundo, porque os segredos TOTP são cifrados com ela.
+      MFA_ENCRYPTION_KEY: ci-chave-de-teste-sem-valor-com-mais-de-32-caracteres
+      NODE_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A versão vem do `.node-version`, que o Render TAMBÉM lê. Um arquivo só
+      # para os dois: se a CI e a produção pudessem divergir, o portão deixaria
+      # de testar o ambiente que de fato roda — e foi assim que os testes de
+      # front passaram meses verdes na máquina de quem escreve e vermelhos aqui.
+      #
+      # ⚠ O PISO É 22.12, NÃO 22. Foi na 22.12 que `require()` de módulo ESM
+      # passou a funcionar. Na 20 (e na 22.11) o jsdom estoura ERR_REQUIRE_ESM
+      # ao carregar `@exodus/bytes` pelo `html-encoding-sniffer`, e o vitest
+      # morre ANTES de coletar qualquer teste — "no tests" com saída 1, o que
+      # derrubava o passo e impedia integração, auditoria e build de rodarem.
+      # Baixar daqui reabre exatamente esse buraco.
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      # `npm ci` falha se o lockfile divergir do package.json — é a verificação
+      # de integridade que faltava.
+      - name: Instalar (lockfile íntegro)
+        run: npm ci
+
+      - name: Tipos
+        run: npm run typecheck
+
+      - name: Testes de unidade (API + front)
+        run: npm test
+
+      # As extensões vêm de migration, mas pg_trgm exige o papel certo: criar
+      # aqui evita um erro obscuro no meio da suíte.
+      - name: Preparar banco de teste
+        run: |
+          PGPASSWORD=ci psql -h localhost -U miner -d miner -c 'CREATE DATABASE miner_test;'
+          npm run test:int:preparar -w @miner/api
+
+      - name: Testes de integração
+        run: npm run test:int
+
+      # --omit=dev é o ponto: dos 38 achados do audit, só os da árvore de
+      # PRODUÇÃO podem ser explorados por um usuário. Auditar tudo junto afoga o
+      # que importa em ruído de ferramenta de build.
+      #
+      # Passou a ser um script, e não `npm audit` direto, porque o comando cru
+      # reprovava TODO push por causa de um único aviso já investigado e aceito
+      # por escrito — js-yaml via @nestjs/swagger, corrigido em 17/08/2026 pelo
+      # bump para a 11.4.7. A lista de aceites hoje está VAZIA, e o portão fica
+      # verde por ausência de risco, não por decisão registrada.
+      # Portão sempre vermelho não é rigor: é o jeito mais rápido de
+      # ensinar todo mundo a ignorar um alerta de segurança. O script deixa
+      # passar só o que está na lista de aceites — com nome, data e motivo — e
+      # reprova qualquer coisa nova.
+      - name: Vulnerabilidades em dependências de produção
+        run: npm run audit:prod
+
+      - name: Build
+        run: npm run build
+        env:
+          NODE_ENV: production
+          NEXT_PUBLIC_API_URL: https://exemplo-de-ci.invalid/api
+
+      # O build "passar" não prova que ele produziu o que o deploy vai executar.
+      # Aconteceu de verdade: um spec em src/ importou um utilitário de test/, o
+      # tsc deslocou a raiz de compilação, a saída virou dist/src/main.js e o
+      # `startCommand` do render.yaml (`node apps/api/dist/main.js`) passou a
+      # apontar para um arquivo inexistente. Tudo verde, deploy morto na largada.
+      - name: O artefato de produção é o que o deploy espera
+        run: |
+          test -f apps/api/dist/main.js \
+            || { echo "apps/api/dist/main.js não existe — o startCommand do render.yaml quebraria"; \
+                 echo "conteúdo de apps/api/dist:"; ls -la apps/api/dist; exit 1; }
+          test -d apps/web/.next \
+            || { echo "apps/web/.next não existe — o site não teria o que servir"; exit 1; }
+          echo "artefatos conferidos"
+
+      # ─────────────────────────────────────────────────────────────────────
+      # PUBLICAR — o passo que faltava para o render.yaml dizer a verdade.
+      #
+      # Os três serviços têm `autoDeploy: false` com o comentário "quem publica
+      # é o CI, depois do verde". Só que o gancho nunca existiu: durante 44
+      # execuções o comentário foi uma intenção, e todo deploy foi manual.
+      #
+      # ── POR QUE É O ÚLTIMO PASSO, E NÃO UMA JOB SEPARADA ──
+      #
+      # Steps de uma job só rodam se os anteriores passaram. Sendo o último,
+      # este herda de graça a condição que importa: tipos, unidade, integração,
+      # auditoria de vulnerabilidades, build e conferência de artefato TODOS
+      # verdes. Uma job separada precisaria repetir a dependência à mão, e
+      # `needs:` sozinho não distingue "passou" de "foi pulado".
+      #
+      # ── SÓ EM PUSH NA MAIN ──
+      #
+      # O workflow também roda em pull_request. Sem esta condição, abrir um PR
+      # publicaria o código do PR em produção — o oposto do que uma revisão
+      # existe para fazer.
+      #
+      # ── A ORDEM NÃO É ALFABÉTICA ──
+      #
+      # A API primeiro, porque é o `preDeploy` dela que roda as migrations. O
+      # site por último, porque a direção perigosa é site-novo com API-velha:
+      # uma página pedindo rota que ainda não existe. O contrário é inofensivo
+      # — rota nova sem ninguém chamando.
+      #
+      # A espera de 90s é heurística, não garantia: o gancho responde no ato,
+      # e quem leva minutos é o build lá dentro. O que de fato limita o
+      # estrago é a Render manter a versão antiga servindo até a nova passar
+      # no health check — a espera só encurta a janela.
+      #
+      # ── OS SEGREDOS NUNCA APARECEM NO LOG ──
+      #
+      # A URL do gancho É a credencial: quem a tiver publica quando quiser.
+      # Por isso `-o /dev/null` e só o código HTTP na saída. `--fail` faz o
+      # passo quebrar se a Render recusar, em vez de seguir verde fingindo que
+      # publicou.
+      - name: Publicar na Render
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          HOOK_API: ${{ secrets.RENDER_DEPLOY_HOOK_API }}
+          HOOK_WORKER: ${{ secrets.RENDER_DEPLOY_HOOK_WORKER }}
+          HOOK_WEB: ${{ secrets.RENDER_DEPLOY_HOOK_WEB }}
+        run: |
+          set -euo pipefail
+
+          # Ausência de segredo NÃO derruba a CI — quebraria todo fork e todo
+          # clone que não tenha os ganchos. Mas avisa alto, porque o silêncio
+          # aqui seria "achei que estava publicando" por semanas.
+          if [ -z "${HOOK_API}" ]; then
+            echo "::warning::RENDER_DEPLOY_HOOK_API ausente — NADA foi publicado."
+            echo "Cadastre os três secrets no repositório para o verde publicar sozinho."
+            exit 0
+          fi
+
+          disparar() {
+            local nome="$1" url="$2"
+            if [ -z "${url}" ]; then
+              echo "::warning::gancho de ${nome} ausente — serviço NÃO publicado."
+              return 0
+            fi
+            local codigo
+            codigo=$(curl -sS --fail --max-time 30 -o /dev/null -w '%{http_code}' -X POST "${url}")
+            echo "  ${nome}: HTTP ${codigo}"
+          }
+
+          echo "→ API (roda as migrations no preDeploy)"
+          disparar "miner-api" "${HOOK_API}"
+
+          echo "→ aguardando 90s antes do resto, para a API chegar primeiro"
+          sleep 90
+
+          echo "→ worker e site"
+          disparar "miner-worker" "${HOOK_WORKER}"
+          disparar "miner-web" "${HOOK_WEB}"
+
+          echo "publicação disparada; acompanhe em dashboard.render.com"

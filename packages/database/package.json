@@ -1,0 +1,31 @@
+{
+  "name": "@miner/database",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./generated/client/index.js",
+  "types": "./generated/client/index.d.ts",
+  "scripts": {
+    "generate": "prisma generate",
+    "migrate": "prisma migrate dev",
+    "migrate:deploy": "prisma migrate deploy",
+    "studio": "prisma studio",
+    "reset": "node scripts/reset-seguro.js",
+    "validate": "prisma validate",
+    "format": "prisma format",
+    "seed": "tsx prisma/seed.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "//": "O CLI `prisma` fica em dependencies, e não em devDependencies, de propósito: o build roda `prisma generate` (o client é gitignored — sem isso um clone limpo NÃO compila) e o deploy roda `prisma migrate deploy`. Com NODE_ENV=production o npm omite devDependencies, e o binário sumiria exatamente no ambiente que precisa dele.",
+  "dependencies": {
+    "@node-rs/argon2": "^2.0.2",
+    "@prisma/client": "^5.22.0",
+    "prisma": "^5.22.0"
+  },
+  "devDependencies": {
+    "read-excel-file": "^9.3.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

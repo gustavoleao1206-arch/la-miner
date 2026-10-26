@@ -1,0 +1,398 @@
+# Infraestrutura na Render, versionada.
+#
+# Existe para que o deploy seja REPRODUTÍVEL: antes não havia Dockerfile,
+# render.yaml, script de build nem quem aplicasse as migrations — publicar
+# dependia de alguém lembrar a sequência certa, e não havia artefato para voltar
+# atrás. Configuração no painel não entra em code review nem em rollback.
+#
+# ⚠ NENHUM SEGREDO AQUI. `sync: false` significa "esta variável existe e o valor
+# é definido à mão no painel" — a Render não a copia entre ambientes nem a expõe
+# no repositório.
+
+databases:
+  - name: miner-postgres
+    databaseName: miner
+    user: miner
+    plan: basic-256mb
+    postgresMajorVersion: "16"
+    # A retenção de PITR é o que transforma "temos backup" em "conseguimos
+    # voltar para 10 minutos atrás". Vale mais que qualquer dump manual.
+    ipAllowList: []          # só a rede interna da Render alcança o banco
+
+services:
+  # ── API ──
+  - type: web
+    name: miner-api
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    # `npm ci` e não `npm install`: respeita o lockfile e falha se ele divergir
+    # do package.json, em vez de resolver versões novas silenciosamente no build.
+    #
+    # `--include=dev` NÃO é opcional aqui. Este serviço declara NODE_ENV=production
+    # logo abaixo, e o npm omite devDependencies quando enxerga esse valor — mas
+    # `nest build` VEM de uma devDependency (@nestjs/cli), assim como o typescript.
+    # Sem a flag o build morre em "nest: not found", e a CI não avisa: lá o
+    # `npm ci` roda com NODE_ENV=test e só o passo de build vira production, com
+    # as devDependencies já no disco.
+    buildCommand: npm ci --include=dev && npm run build:api
+    startCommand: npm run start:api
+    # Roda ANTES de trocar o tráfego para a versão nova. É o que garante que o
+    # código novo nunca encontre um banco velho — o modo de falha da migration
+    # pendente é silencioso: a instância sobe, parece saudável e devolve 500.
+    preDeployCommand: npm run db:migrate:deploy
+    healthCheckPath: /api/v1/health
+    autoDeploy: false        # quem publica é o CI, depois do verde
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: miner-postgres
+          property: connectionString
+      - key: REDIS_HOST
+        fromService:
+          name: miner-redis
+          type: redis
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          name: miner-redis
+          type: redis
+          property: port
+      # 2 saltos: a Render serve o app atrás da PRÓPRIA Cloudflare, então são
+      # dois proxies, não um. Já esteve "1", e com isso o rate limit ficou MORTO
+      # — o `req.ip` resolvia para o nó de borda, que muda a cada requisição, e
+      # cada chamada caía num balde novo. Medido no log de produção: o
+      # X-Forwarded-For chega com 2 entradas, [IP real, borda].
+      # NUNCA `true`, e nunca 3 — ver a nota longa em configurar-app.ts, que traz
+      # a medição e o teste de forja.
+      - key: TRUST_PROXY_HOPS
+        value: "2"
+      - key: SWAGGER_ENABLED
+        value: "false"
+      # FALTAVA, e o default do zod é `http://localhost:3000` — então tudo que
+      # monta URL para o cliente montava para a máquina do desenvolvedor.
+      #
+      # Custou uma cobrança quebrada em produção (19/08/2026): o `callback.
+      # successUrl` que a emissão manda ao Asaas saía como
+      # `http://localhost:3000/login?...`, e o gateway recusa callback para
+      # domínio que não é da conta — 400 na cara do cliente que clicou em
+      # "Gerar cobrança". O default silencioso é pior que a ausência: sem ele o
+      # boot teria falhado e ninguém teria descoberto pelo caixa.
+      #
+      # É `app.` e não o ápice: o ápice serve a landing comercial, e este valor
+      # é a raiz do SISTEMA (o /login para onde o Asaas devolve quem pagou, e o
+      # link de confirmação de e-mail). Medido: app.laminer.com.br/login
+      # responde 200 direto, sem redirecionar.
+      - key: WEB_URL
+        value: https://app.laminer.com.br
+      - key: CORS_ORIGINS
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        generateValue: true   # a Render gera e guarda; ninguém digita
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      # Cifra o segredo TOTP no banco. `generateValue` como os JWT: ninguém
+      # digita, e ela nunca passa por um terminal.
+      #
+      # ⚠ DIFERENÇA IMPORTANTE em relação aos JWT: perder ESTA chave não derruba
+      # sessões, apaga os cadastros de MFA — cada usuário terá de entrar por um
+      # código de recuperação e cadastrar o app de novo. Copie-a para o cofre de
+      # senhas depois do primeiro deploy; a Render é onde ela RODA, não onde ela
+      # deve ser guardada.
+      - key: MFA_ENCRYPTION_KEY
+        generateValue: true
+      # `todos` — decisão do dono em 03/09/2026. Era `nenhum`.
+      #
+      # O medo que segurava isto ("exigir MFA antes de haver cadastro tranca
+      # todo mundo, inclusive ele") foi desenhado para fora pelo
+      # MfaObrigatorioGuard: quem está em falta ENTRA — a senha continua
+      # valendo — e só alcança o próprio cadastro do segundo fator, pelas rotas
+      # @SemMfa. O front redireciona para /seguranca?obrigatorio=1 a partir de
+      # qualquer 403 com esse código, e `mfaHabilitado` é relido do banco a cada
+      # requisição: cadastrou, a requisição seguinte passa. Provado ponta a ponta
+      # em mfa-obrigatorio.int-spec.ts ANTES de virar a chave.
+      #
+      # Efeito na virada: cada usuário sem segundo fator é interrompido UMA vez,
+      # na primeira requisição depois do deploy, e resolve sozinho. Ninguém fica
+      # de fora. Exige MFA_ENCRYPTION_KEY — sem ela o zod recusa o boot.
+      - key: MFA_OBRIGATORIO
+        value: todos
+      - key: ENRICHMENT_PROVIDER
+        sync: false
+      - key: CONTACTRA_BASE_URL
+        sync: false
+      - key: CONTACTRA_CLIENT_ID
+        sync: false
+      - key: CONTACTRA_CLIENT_SECRET
+        sync: false
+      # FALTAVA, e o modo de falha era o pior possível: a validação de ambiente
+      # NÃO exige esta variável (o refine cobre só BASE_URL, CLIENT_ID e
+      # CLIENT_SECRET), então o serviço subia inteiro, o health respondia e o
+      # painel abria — e a PRIMEIRA consulta de CPF morria em 503, porque
+      # `obterToken()` a lê direto do ambiente e recusa quando ela vem vazia.
+      # Erro longe da causa: parece credencial errada, é variável ausente.
+      - key: CONTACTRA_TOKEN_URL
+        sync: false
+      # ── O TETO DE CONSULTAS PAGAS ──
+      #
+      # Estava fora deste arquivo, valendo o padrão 500 do código. Isso bastou
+      # enquanto a base crescia aos poucos; a importação de pré-precatórios —
+      # 1.137 pessoas novas de uma vez — passa disso num único dia.
+      #
+      # ⚠ O teto NÃO foi removido, e não poderia ser: o validador exige inteiro
+      # positivo, e o serviço documenta por que ele existe — "o scope da
+      # credencial é ALL: a Contactra não impõe limite, então o limite tem que
+      # ser nosso. Sem isto, um laço com defeito ou uma importação grande demais
+      # viram fatura". 2000 cabe a importação inteira com folga e ainda barra o
+      # laço com defeito muito antes de o estrago ficar caro.
+      #
+      # Estourar o teto não adia para amanhã: o processor converte em
+      # UnrecoverableError e o job morre sem retry — só volta por
+      # POST /fila/reprocessar. Por isso o número sobe ANTES da importação.
+      - key: CONTACTRA_TETO_DIARIO
+        value: "2000"
+      # ── O ENRIQUECIMENTO PASSA A GASTAR DE VERDADE ──
+      #
+      # `SYNC_DRY_RUN` tem `default('true')` no validador e estava fora deste
+      # arquivo. O padrao e fail-safe de proposito — variavel ausente significa
+      # NAO GASTAR —, e por isso ele segurou por meses sem ninguem notar.
+      #
+      # Foi o que aconteceu na primeira importacao de pre-precatorios: 1.137
+      # jobs concluidos em menos de um minuto, zero falhas e o contador da
+      # Contactra em ZERO. O processor registrava "[DRY RUN] consultaria CPF
+      # ***xxxx" e voltava antes de tocar no provedor.
+      #
+      # Desligar isto e decisao de gastar dinheiro, e por isso mora aqui, com o
+      # motivo ao lado, em vez de num campo do painel que ninguem lembra de ter
+      # mudado.
+      #
+      # ⚠ O QUE CONTINUA SEGURANDO: `CONTACTRA_TETO_DIARIO` logo acima. O
+      # dry-run era uma trava binaria; o teto e a que sobra, e e ela que impede
+      # um laco com defeito de virar fatura.
+      #
+      # Nos DOIS servicos, e aqui pela razao menos obvia: quem CONSOME e o
+      # worker, mas o `FilaController` — que vive na API — injeta o
+      # `SincronizacaoAgendada` e devolve `dryRun` na PREVISAO da rodada. Valores
+      # diferentes fariam a tela anunciar "simulacao" enquanto o worker cobra.
+      - key: SYNC_DRY_RUN
+        value: "false"
+      - key: BILLING_PROVIDER
+        sync: false
+      - key: ASAAS_API_KEY
+        sync: false
+      - key: ASAAS_WEBHOOK_TOKEN
+        sync: false
+      # Os três crons nascem DESLIGADOS, como em toda a cadeia de defaults deste
+      # projeto: o de cobrança suspende cliente, o de distribuição entrega
+      # carteira e o de sincronização gasta crédito. Ligar é ato consciente.
+      - key: SYNC_AGENDADA_ATIVA
+        value: "false"
+      # Fica "false" AQUI e "true" no worker — e não é descuido. Nesta API a
+      # variável é INERTE: o ScheduleModule só é registrado quando o papel é
+      # worker, então nenhum @Cron chega a existir neste processo. Ligá-la aqui
+      # não entregaria carteira nenhuma e ainda pareceria resolvido, que é o
+      # jeito mais caro de errar.
+      - key: DISTRIBUICAO_AGENDADA_ATIVA
+        value: "false"
+      - key: COBRANCA_AGENDADA_ATIVA
+        value: "false"
+      # A API SERVE, o worker TRABALHA. Sem esta linha o processo faria os dois,
+      # e com o worker abaixo no ar seriam DOIS consumidores da mesma fila.
+      - key: PAPEL_PROCESSO
+        value: "api"
+
+  # ── Worker ──
+  #
+  # ⚠ CUSTA UM SERVIÇO A MAIS. Se a decisão for não pagar por ele, APAGUE este
+  # bloco inteiro e troque o PAPEL_PROCESSO da API para "tudo" — o sistema volta
+  # ao comportamento de processo único, que funciona. O que NÃO pode é manter os
+  # dois: seriam dois consumidores da mesma fila e os crons rodariam em dobro.
+  #
+  # O que se compra com ele:
+  #  • um job pesado deixa de disputar CPU com as requisições dos clientes;
+  #  • o deploy da API para de matar a consulta paga que estava em voo;
+  #  • os crons passam a ter UM lugar só — hoje eles rodam em toda instância,
+  #    então escalar a API para duas dispararia a sincronização em duplicidade,
+  #    e ela gasta crédito da Contactra.
+  #
+  # `type: worker` não expõe porta: nada para escanear, nada para atacar.
+  - type: worker
+    name: miner-worker
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    # MESMO build da API: o `nest build` compila os dois pontos de entrada
+    # porque `main.worker.ts` está sob `src/`. Não há artefato separado — e por
+    # isso o `--include=dev` também é obrigatório aqui, pelo mesmo motivo.
+    buildCommand: npm ci --include=dev && npm run build:api
+    startCommand: npm run start:worker
+    # Sem preDeployCommand: quem roda as migrations é a API, e uma só. Dois
+    # serviços migrando o mesmo banco no mesmo deploy é corrida garantida.
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PAPEL_PROCESSO
+        value: "worker"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: miner-postgres
+          property: connectionString
+      - key: REDIS_HOST
+        fromService:
+          name: miner-redis
+          type: redis
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          name: miner-redis
+          type: redis
+          property: port
+      # O worker NÃO tem porta, então não USA TRUST_PROXY_HOPS nem CORS — mas
+      # PRECISA declarar o primeiro mesmo assim. Ele carrega o mesmo AppModule
+      # da API (main.worker.ts), e o `validate` do ConfigModule roda o refine de
+      # env.validation.ts que exige TRUST_PROXY_HOPS ≥ 1 sempre que NODE_ENV é
+      # production. O valor é inerte aqui: satisfaz o zod e nada mais. Sem ele o
+      # worker não sobe, e o erro sai como falha de validação de ambiente — que
+      # não parece, à primeira vista, ter relação nenhuma com proxy.
+      #
+      # Vai com o MESMO valor da API de propósito, embora inerte: dois números
+      # diferentes para a mesma variável fariam o próximo leitor procurar um
+      # significado que não existe.
+      - key: TRUST_PROXY_HOPS
+        value: "2"
+      # Os segredos de JWT entram porque o TokenService está na árvore de
+      # providers do AppModule compartilhado — ele não os usa aqui, mas a
+      # validação de ambiente exige que existam.
+      - key: JWT_ACCESS_SECRET
+        fromService:
+          name: miner-api
+          type: web
+          envVarKey: JWT_ACCESS_SECRET
+      - key: JWT_REFRESH_SECRET
+        fromService:
+          name: miner-api
+          type: web
+          envVarKey: JWT_REFRESH_SECRET
+      # É AQUI que os crons são ligados, e não mais na API.
+      - key: ENRICHMENT_PROVIDER
+        sync: false
+      - key: CONTACTRA_BASE_URL
+        sync: false
+      - key: CONTACTRA_CLIENT_ID
+        sync: false
+      - key: CONTACTRA_CLIENT_SECRET
+        sync: false
+      # FALTAVA, e o modo de falha era o pior possível: a validação de ambiente
+      # NÃO exige esta variável (o refine cobre só BASE_URL, CLIENT_ID e
+      # CLIENT_SECRET), então o serviço subia inteiro, o health respondia e o
+      # painel abria — e a PRIMEIRA consulta de CPF morria em 503, porque
+      # `obterToken()` a lê direto do ambiente e recusa quando ela vem vazia.
+      # Erro longe da causa: parece credencial errada, é variável ausente.
+      - key: CONTACTRA_TOKEN_URL
+        sync: false
+      # Também AQUI, e não só na API — e aqui é onde ele de fato pesa: quem gasta
+      # crédito é o enriquecimento.processor, que mora NESTE processo. A API lê o
+      # mesmo teto para responder GET /fila/consumo; valores diferentes fariam a
+      # tela mentir sobre quanto ainda cabe no dia.
+      - key: CONTACTRA_TETO_DIARIO
+        value: "2000"
+      # Tambem AQUI, e aqui e onde o dinheiro sai: o `enriquecimento.processor`
+      # le esta variavel na linha 140 e devolve DRY_RUN antes da chamada paga.
+      # A API le a mesma para nao mentir na previsao da rodada.
+      - key: SYNC_DRY_RUN
+        value: "false"
+      # Também AQUI, e não só na API: quem emite a fatura mensal é o CRON, que
+      # mora neste processo (cobranca.agendada.ts chama emitirFatura). Declarar
+      # só na API consertaria a emissão que o cliente dispara clicando — e
+      # deixaria quebrada a automática, que é justamente a que ninguém vê
+      # falhar. Os dois serviços montam URL para o cliente; os dois precisam
+      # saber onde o cliente mora.
+      - key: WEB_URL
+        value: https://app.laminer.com.br
+      - key: BILLING_PROVIDER
+        sync: false
+      - key: ASAAS_API_KEY
+        sync: false
+      - key: ASAAS_WEBHOOK_TOKEN
+        sync: false
+      - key: SYNC_AGENDADA_ATIVA
+        value: "false"
+      # LIGADO aqui, e SÓ aqui: é o cron que entrega os +250 de cada ciclo, e a
+      # acumulação (250 → 500 → 750) depende dele rodar todo mês. Na API a mesma
+      # variável é INERTE — o ScheduleModule só é registrado no papel worker
+      # (app.module.ts + papel-do-processo.ts), então ligá-la lá não faria nada
+      # e ainda daria a impressão de que está resolvido.
+      # A varredura busca assinatura ATIVA com `proximaRenovacaoEm` nula ou
+      # vencida; a nula é, de propósito, quem nunca gerou ciclo.
+      - key: DISTRIBUICAO_AGENDADA_ATIVA
+        value: "true"
+      # Retenção de IP/user agent nos registros de acesso: 180 dias é o PISO do
+      # art. 15 do Marco Civil (o zod recusa menos). Declarado aqui para o valor
+      # não viver só como default invisível — a lição do WEB_URL.
+      - key: RETENCAO_REGISTROS_ACESSO_DIAS
+        value: "180"
+      # Vida da linha crua da planilha importada. Curto de propósito: a
+      # finalidade dela é reprocessar uma importação, o que se faz em dias.
+      - key: RETENCAO_PLANILHA_DIAS
+        value: "90"
+      # Vida do TEXTO digitado na busca. NÃO herda o piso de 180: aquele é do
+      # art. 15 do Marco Civil, que obriga a guardar REGISTRO DE ACESSO. O que a
+      # pessoa digitou é conteúdo — a lei manda protegê-lo, não retê-lo.
+      - key: RETENCAO_TERMO_BUSCA_DIAS
+        value: "90"
+      - key: RETENCAO_AGENDADA_ATIVA
+        value: "true"
+      # ── O CRON DO DINHEIRO: painel, não deploy ──
+      #
+      # Ele emite a fatura do mês E processa vencimentos — marca vencida, marca
+      # inadimplente, SUSPENDE. Ligar isto enquanto o ASAAS_API_KEY ainda for de
+      # homologação emitiria cobrança de mentira e suspenderia cliente de
+      # verdade por causa dela: uma fatura que ninguém tem como pagar vence
+      # igual.
+      #
+      # Por isso saiu de `value:` e virou `sync: false`. Não é preguiça de
+      # versionar — é acoplamento: a chave de produção é colada no PAINEL da
+      # Render (segredo não mora em repositório), e este interruptor precisa
+      # virar NO MESMO INSTANTE que ela. Com `value:` aqui, o blueprint
+      # sobrescreveria a mudança do painel na sincronização seguinte e o cron
+      # morreria sozinho, sem ninguém notar até o mês fechar sem faturar.
+      #
+      # Ausente = desligado (o zod tem default 'false'), então o estado seguro
+      # continua sendo o padrão.
+      - key: COBRANCA_AGENDADA_ATIVA
+        sync: false
+
+  # ── Front ──
+  - type: web
+    name: miner-web
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    # `--include=dev` pelo mesmo motivo dos outros dois, e aqui a lista é maior:
+    # `next build` precisa de tailwindcss, postcss, autoprefixer e typescript,
+    # todos declarados em devDependencies.
+    buildCommand: npm ci --include=dev && npm run build:web
+    startCommand: npm run start:web
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Sem ela o BUILD falha de propósito (ver apps/web/lib/config.ts):
+      # variável NEXT_PUBLIC_ é congelada no bundle, então esquecê-la publicaria
+      # um site apontando para localhost, com falha invisível nos dois lados.
+      - key: NEXT_PUBLIC_API_URL
+        sync: false
+
+  # ── Redis (fila de enriquecimento) ──
+  - type: redis
+    name: miner-redis
+    plan: starter
+    region: oregon
+    maxmemoryPolicy: noeviction   # fila não pode perder job por pressão de memória
+    ipAllowList: []

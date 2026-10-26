@@ -1,0 +1,45 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "moduleResolution": "node",
+    "declaration": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    /* EXPLÍCITO, e não inferido. Sem esta linha o tsc deduz a raiz a partir do
+       conjunto de arquivos: bastou um spec em `src/` importar um utilitário de
+       `test/` para a raiz virar a pasta do app, e a saída passar de
+       `dist/main.js` para `dist/src/main.js`.
+       O build seguiu "passando", enquanto `node apps/api/dist/main.js` — o
+       comando de produção — apontava para um arquivo inexistente, e o `.env`
+       resolvido por `__dirname` deixava de ser encontrado.
+       Fixando a raiz, qualquer import de fora de `src/` vira erro de
+       compilação em vez de mudança silenciosa de layout. */
+    "rootDir": "./src",
+    "baseUrl": "./",
+    "incremental": true,
+    /* DENTRO da dist de propósito. O padrão põe o cache em
+       `apps/api/tsconfig.tsbuildinfo`, fora da pasta que o `deleteOutDir` do
+       Nest apaga — então um build "limpo" apagava a saída e MANTINHA o cache,
+       que então afirmava estar tudo em dia. O tsc saía com sucesso sem emitir
+       nada, e o erro só aparecia depois, como "não encontro dist/main.js".
+       Aqui o cache morre junto com o que ele descreve. */
+    "tsBuildInfoFile": "./dist/tsconfig.tsbuildinfo",
+    "skipLibCheck": true,
+    "strict": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "strictBindCallApply": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "test"]
+}

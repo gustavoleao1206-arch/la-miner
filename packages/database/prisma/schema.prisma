@@ -1,0 +1,1730 @@
+// LEÃO AMORIM MINER — modelo de dados
+// As decisões que sustentam cada modelo estão nos comentários `///` ao lado dele.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TENANT E ACESSO
+// ═══════════════════════════════════════════════════════════════════
+
+enum TipoOrganizacao {
+  INTERNA // Leão Amorim: dona da base inteira; opera minerador, fila e importação
+  CLIENTE // assinante: enxerga só a carteira liberada, nunca a infraestrutura
+}
+
+model Organization {
+  id   String  @id @default(uuid()) @db.Uuid
+  nome String
+  cnpj String? @unique
+
+  /// Telefone da EMPRESA assinante — não da pessoa que preencheu o cadastro.
+  /// Vai para o Asaas junto do CNPJ, e é por onde a cobrança avisa o sacado.
+  /// Opcional no banco porque as organizações anteriores ao cadastro público
+  /// não têm; quem exige é o DTO do cadastro, onde a informação existe.
+  telefone String?
+
+  /// INTERNA = a operação Leão Amorim (uma só, dona de tudo). CLIENTE = assinante.
+  /// Default CLIENTE porque, deste ponto em diante, toda org nova nasce de uma
+  /// venda; a org interna que já existia foi marcada INTERNA na migration.
+  tipo TipoOrganizacao @default(CLIENTE)
+
+  ativo     Boolean  @default(true)
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  usuarios    User[]
+  importacoes Importacao[]
+  auditoria   AuditLog[]
+  processos   Processo[]
+  etiquetas   Etiqueta[]
+
+  /// ── SaaS: assinatura, carteira liberada e overlay de CRM por org ──
+  assinatura Assinatura?
+  liberacoes ProcessoLiberado[]
+  carteira   CarteiraProcesso[]
+  anotacoes      AnotacaoProcesso[]
+  contatos   ContatoProcesso[]
+  propostas PropostaNegociacao[]
+  parcelas  ParcelaCessao[]
+  tarefas    TarefaProcesso[]
+  eventos    EventoProcesso[]
+
+  @@map("organizations")
+}
+
+enum Papel {
+  ADMIN // gerencia tudo, inclusive usuários e sincronização
+  OPERADOR // importa e sincroniza; não gerencia usuários
+  CLIENTE // apenas consulta o banco interno
+}
+
+model User {
+  id             String  @id @default(uuid()) @db.Uuid
+  organizationId String  @db.Uuid
+  email          String  @unique
+  senhaHash      String // argon2id
+  nome           String
+  /// SEM default: o papel é decisão explícita de quem cria o usuário.
+  /// Com @default(CLIENTE) e o RolesGuard liberando rota sem @Papeis, qualquer
+  /// usuário criado sem papel explícito nascia com acesso de leitura à carteira.
+  papel          Papel
+  ativo          Boolean @default(true)
+
+  /// Administra a PRÓPRIA organização: convida colegas, ativa/desativa acesso e
+  /// enxerga a assinatura.
+  ///
+  /// ⚠ Eixo SEPARADO de `papel`, e não um valor novo dentro dele. `papel` decide
+  /// quais superfícies da PLATAFORMA o usuário alcança — é ele que o
+  /// @Papeis('ADMIN') dos controllers de distribuição e cobrança consulta. Se
+  /// "administrador do cliente" fosse `papel = ADMIN`, o gestor de um escritório
+  /// assinante passaria a enxergar TODOS os clientes da plataforma. Duas
+  /// perguntas diferentes ("o que você alcança" × "quem manda na sua empresa"),
+  /// duas colunas.
+  gestor Boolean @default(false)
+
+  ultimoLoginEm    DateTime?
+  tentativasFalhas Int       @default(0)
+  bloqueadoAte     DateTime?
+
+  /// Marco de revogação de sessão. Access token com `iat` ANTERIOR a esta data
+  /// é recusado pela JwtStrategy — que já relê o usuário a cada requisição, então
+  /// a verificação não custa consulta nova. É o que faz "encerrar sessões" e
+  /// "trocar senha" valerem NA HORA, em vez de esperar os 15 min do JWT expirar.
+  sessoesRevogadasEm DateTime?
+
+  /// A ÚNICA sessão válida do usuário — a família de refresh aberta no último
+  /// login. O access token carrega a sua própria família em `fam`, e a
+  /// JwtStrategy recusa quem não bate com esta coluna.
+  ///
+  /// ⚠ POR QUE UMA FAMÍLIA, E NÃO OUTRO CARIMBO DE TEMPO como `sessoesRevogadasEm`:
+  /// `iat` do JWT tem resolução de SEGUNDOS. Um marco gravado com milissegundos
+  /// no instante do login recusaria o token que o próprio login acabou de emitir
+  /// — entrar e ser expulso no mesmo gesto. Comparar IDENTIDADE de família não
+  /// tem essa borda.
+  ///
+  /// `null` = nenhuma sessão aberta (logout, senha trocada, sessões encerradas).
+  familiaSessaoAtual String? @db.Uuid
+
+  /// Segredo TOTP, CIFRADO (AES-256-GCM, ver segredo-cifrado.ts). A chave mora
+  /// no ambiente, não aqui: é o que faz um dump do banco NÃO entregar o segundo
+  /// fator junto com o primeiro.
+  ///
+  /// Null = nunca cadastrado. Preenchido com `mfaConfirmadoEm` NULO = cadastro
+  /// começado e não confirmado — não vale como segundo fator, e é sobrescrito
+  /// se a pessoa recomeçar. Só o par (segredo + confirmação) liga o MFA.
+  mfaSegredo      String?
+  mfaConfirmadoEm DateTime?
+
+  /// ── Confirmação de e-mail (cadastro público) ──
+  ///
+  /// O MESMO molde do par mfaSegredo/mfaConfirmadoEm: nulo = nunca confirmado.
+  /// Quem nasce pelo cadastro PÚBLICO nasce sem confirmação (com a trava
+  /// CONFIRMACAO_EMAIL_ATIVA ligada); quem é convidado pela equipe nasce
+  /// confirmado — o gestor entrega a credencial em mãos, e o e-mail do colega
+  /// pode nem ser real. Usuários ANTERIORES a esta coluna são confirmados por
+  /// antiguidade na migration: já pagam e usam, e um deploy não tranca ninguém.
+  emailConfirmadoEm         DateTime?
+  /// SHA-256 do token do link — o banco nunca vê o token em claro, como o
+  /// refresh. @unique porque a confirmação busca POR ELE.
+  emailConfirmacaoTokenHash String?   @unique
+  /// Vencimento do link. Vencido, o link morre E o cadastro vira reciclável:
+  /// é o que impede um e-mail digitado errado de trancar o CNPJ para sempre.
+  emailConfirmacaoExpiraEm  DateTime?
+
+  /// ── REDEFINIÇÃO DE SENHA ──
+  /// Mesmo desenho da confirmação, e pela mesma razão: só o SHA-256 mora aqui,
+  /// então um dump do banco não redefine a senha de ninguém. @unique porque a
+  /// redefinição busca POR ELE.
+  ///
+  /// Colunas SEPARADAS das de confirmação de propósito. Reaproveitar aquelas
+  /// misturaria dois links com poderes MUITO diferentes — um ativa a conta, o
+  /// outro TROCA A SENHA — e faria a validade de 48h da confirmação valer
+  /// também para o reset, que precisa ser curto justamente por ser o mais
+  /// perigoso dos dois.
+  senhaResetTokenHash       String?   @unique
+  senhaResetExpiraEm        DateTime?
+
+  /// Último contador TOTP aceito. Um código vale por até 90 segundos e, sem
+  /// isto, funcionaria QUANTAS VEZES fosse apresentado nesse intervalo — quem
+  /// interceptasse um código teria uma janela real de uso. Exigir um contador
+  /// estritamente maior gasta o código no primeiro uso.
+  ///
+  /// BigInt, e não Int: o contador é o Unix time dividido por 30, e passaria do
+  /// teto de int4 em 2038.
+  mfaUltimoContador BigInt?
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  organization   Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  refreshTokens  RefreshToken[]
+  mfaCodigos     MfaCodigoRecuperacao[]
+  importacoes    Importacao[]
+  auditoria      AuditLog[]
+  consultas      ConsultaCliente[]
+  anotacoes      AnotacaoProcesso[]
+  contatos       ContatoProcesso[]
+  /// Duas relações para a proposta, pela mesma razão das tarefas: QUEM OFERECEU
+  /// e quem registrou a resposta do titular são papéis diferentes, e um mesmo
+  /// usuário costuma ocupar os dois em processos distintos.
+  propostas             PropostaNegociacao[] @relation("PropostasFeitas")
+  propostasRespondidas  PropostaNegociacao[] @relation("PropostasRespondidas")
+  baixasDeParcela       ParcelaCessao[]      @relation("BaixasDeParcela")
+  /// Nome explícito porque User se liga a Processo por dois caminhos possíveis
+  /// no futuro (responsável, autor de anotação); sem ele o Prisma não sabe qual.
+  processos      Processo[]         @relation("ProcessosSobResponsabilidade")
+  /// Duas relações para TarefaProcesso: quem executa e quem pediu são papéis
+  /// diferentes, e a mesma tarefa costuma ter pessoas distintas nos dois.
+  tarefas        TarefaProcesso[]   @relation("TarefasAtribuidas")
+  tarefasCriadas TarefaProcesso[]   @relation("TarefasCriadas")
+  /// Processos sob responsabilidade deste usuário no overlay de CRM de um cliente.
+  carteiras      CarteiraProcesso[] @relation("CarteiraResponsavel")
+
+  @@index([organizationId])
+  @@index([email])
+  @@map("users")
+}
+
+/// Refresh token rotativo. Guardamos só o HASH — vazamento do banco não permite login.
+/// Reuso de token revogado derruba a família inteira (detecção de roubo).
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  tokenHash  String    @unique
+  familiaId  String    @db.Uuid
+  expiraEm   DateTime
+  revogadoEm DateTime?
+  ip         String?
+  userAgent  String?
+  criadoEm   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familiaId])
+  @@index([expiraEm])
+  @@map("refresh_tokens")
+}
+
+/// Código de recuperação do MFA — a saída para quem perdeu o telefone.
+///
+/// Sem eles, o segundo fator transforma um celular quebrado em conta perdida, e
+/// a "solução" vira o administrador desligando o MFA por telefone: um caminho de
+/// engenharia social melhor que o próprio login.
+///
+/// Guardados em SHA-256, como o refresh token. Argon2 seria o instinto, mas aqui
+/// não cabe: estes códigos são gerados pelo sistema com 80 bits de entropia — não
+/// são senha humana, não há dicionário para atacar, e força bruta de 80 bits não
+/// acontece. Em compensação, o argon2 do login teria de rodar até dez vezes por
+/// tentativa (uma por código), com 19 MiB cada.
+model MfaCodigoRecuperacao {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  codigoHash String    @unique
+  /// Uso ÚNICO: a linha fica para o usuário ver quantos gastou, mas não serve
+  /// mais. Apagar esconderia que um código foi usado — que é justamente o que se
+  /// quer enxergar depois de uma suspeita.
+  usadoEm    DateTime?
+  criadoEm   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("mfa_codigos_recuperacao")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SAAS — ASSINATURA, LOTES E LIBERAÇÃO
+//
+//  O pivô do produto. Até aqui, Processo.organizationId fazia dois papéis ao
+//  mesmo tempo: "de quem é o processo" E "quem pode vê-lo". Isso não sustenta um
+//  mesmo processo visível para vários clientes. Aqui a visibilidade vira coisa
+//  própria — a LIBERAÇÃO —, separada da propriedade. A org INTERNA é dona da base
+//  e vê tudo sem passar por estas tabelas; a org CLIENTE só vê o que foi liberado.
+// ═══════════════════════════════════════════════════════════════════
+
+enum StatusAssinatura {
+  PENDENTE // criada, aguardando o primeiro pagamento confirmar
+  ATIVA // em dia; recebe lotes na renovação
+  INADIMPLENTE // pagamento falhou; carência antes de suspender
+  SUSPENSA // sem acesso; dados preservados, sem novos lotes
+  CANCELADA // encerrada
+}
+
+/// Catálogo de planos. O "plano inicial" do pedido é 250 processos/mês.
+model Plano {
+  id                String  @id @default(uuid()) @db.Uuid
+  nome              String  @unique
+  descricao         String?
+  /// Quantos processos NOVOS o cliente recebe a cada ciclo.
+  processosPorCiclo Int
+  /// Quantos perfis a organização assinante pode ter ATIVOS, contando o titular.
+  /// Regra comercial, e por isso mora aqui: um plano maior é uma linha nova, não
+  /// um deploy. Só vale para org CLIENTE — a operação interna não assina plano.
+  usuariosPorPlano  Int     @default(5)
+  /// Preço por ciclo, em reais.
+  preco             Decimal @db.Decimal(12, 2)
+  /// Meses entre renovações. 1 = mensal.
+  intervaloMeses    Int     @default(1)
+  ativo             Boolean @default(true)
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  assinaturas Assinatura[]
+
+  @@map("planos")
+}
+
+/// Uma assinatura por org CLIENTE (organizationId @unique). Esta linha é o ESTADO
+/// ATUAL do vínculo; o histórico de ciclos vive em LoteAssinatura e o de
+/// pagamentos virá numa tabela de faturas (fase de billing).
+model Assinatura {
+  id             String           @id @default(uuid()) @db.Uuid
+  organizationId String           @unique @db.Uuid
+  planoId        String           @db.Uuid
+  status         StatusAssinatura @default(PENDENTE)
+
+  inicioEm DateTime @default(now())
+
+  /// Quando o cron deve gerar o próximo lote. @db.Date porque renovação é um DIA,
+  /// não um instante — não pode escorregar com o fuso do servidor.
+  proximaRenovacaoEm DateTime? @db.Date
+  canceladaEm        DateTime?
+
+  /// ATÉ QUANDO O CICLO JÁ ESTÁ PAGO — o fim do período coberto, exclusivo.
+  ///
+  /// Pagou a competência de agosto num plano de 1 mês? `pagoAte` = 1º de setembro.
+  /// Num plano de 12? = 1º de agosto do ano seguinte. A cobrança pergunta a esta
+  /// coluna antes de emitir, e se cala enquanto o período ainda cobre hoje.
+  ///
+  /// ⚠ ESTA COLUNA É SÓ SOBRE DINHEIRO. Quem manda na ENTREGA é
+  /// `proximaRenovacaoEm`, e as duas andam em cadências diferentes de propósito:
+  /// no plano anual o cliente paga UMA vez e recebe 250 processos TODO MÊS.
+  /// Confundir as duas é o erro que faria o anual entregar uma vez por ano.
+  ///
+  /// Nula = nunca houve pagamento. Não é o mesmo que "vencido": quem nunca pagou
+  /// não tem período coberto nenhum, e a cobrança emite normalmente.
+  pagoAte DateTime? @db.Date
+
+  /// ── Cobrança ──
+  /// Qual porta emitiu esta assinatura ("manual", "asaas", ...). Guardado na
+  /// LINHA, não lido do env na hora: trocar de gateway não pode reinterpretar
+  /// retroativamente os ids externos que o anterior gerou.
+  provedorCobranca    String?
+  /// Ids no gateway. Nulos no provedor manual.
+  clienteExternoId    String?
+  assinaturaExternaId String?
+  /// Quando a inadimplência começou — é dela que sai a carência antes de suspender.
+  inadimplenteDesde   DateTime?
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  organization Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  plano        Plano            @relation(fields: [planoId], references: [id])
+  lotes        LoteAssinatura[]
+  faturas      Fatura[]
+
+  /// O cron de renovação varre por (status, dia): "ativas que vencem até hoje".
+  @@index([status, proximaRenovacaoEm])
+  @@map("assinaturas")
+}
+
+/// Um ciclo mensal de distribuição — os "Lotes Mensais" do pedido.
+model LoteAssinatura {
+  id           String   @id @default(uuid()) @db.Uuid
+  assinaturaId String   @db.Uuid
+  /// Competência do ciclo (primeiro dia do mês). @db.Date pelo mesmo motivo.
+  competencia  DateTime @db.Date
+
+  /// Alvo do plano no momento da geração (o plano pode mudar depois).
+  quantidadeAlvo     Int
+  /// Quantos REALMENTE saíram — pode ser menos se a base de processos esgotar.
+  quantidadeLiberada Int @default(0)
+
+  criadoEm DateTime @default(now())
+
+  assinatura Assinatura         @relation(fields: [assinaturaId], references: [id], onDelete: Cascade)
+  liberacoes ProcessoLiberado[]
+
+  /// Um lote por mês por assinatura: é o que torna o cron idempotente (rodar
+  /// duas vezes na mesma competência não gera lote duplicado).
+  @@unique([assinaturaId, competencia])
+  @@index([assinaturaId, competencia(sort: Desc)])
+  @@map("lotes_assinatura")
+}
+
+/// A carteira liberada — o vínculo (cliente ↔ processo) que faltava, e o
+/// "Histórico de Distribuição" ao mesmo tempo: cada linha carrega o lote e a data
+/// que a entregou.
+///
+/// É a tabela que MAIS cresce (nº de clientes × processos liberados = dezenas de
+/// milhões). Por isso os índices são mínimos e deliberados; particionamento fica
+/// para a fase de escala.
+model ProcessoLiberado {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  processoId     String   @db.Uuid
+  loteId         String   @db.Uuid
+  liberadoEm     DateTime @default(now())
+
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  processo     Processo       @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  lote         LoteAssinatura @relation(fields: [loteId], references: [id], onDelete: Cascade)
+
+  /// A regra "nunca reenviar o mesmo processo ao mesmo cliente" — e a defesa de
+  /// integridade que o motor de distribuição usa para deduplicar.
+  @@unique([organizationId, processoId])
+  /// A carteira do cliente: os recém-liberados primeiro.
+  @@index([organizationId, liberadoEm(sort: Desc)])
+  /// "Quais clientes têm este processo" + o cascade da exclusão do processo.
+  @@index([processoId])
+  @@index([loteId])
+  @@map("processos_liberados")
+}
+
+/// Overlay de CRM por (organização, processo).
+///
+/// Guarda o estado PRIVADO de cada cliente sobre um processo que ele pode ver —
+/// prioridade e responsável. O cliente A e o cliente B trabalham o mesmo processo
+/// sem um enxergar a triagem do outro.
+///
+/// Só orgs CLIENTE gravam aqui. A org interna mantém sua triagem nas colunas
+/// `prioridade`/`responsavelId` do próprio Processo (não migradas nesta fase, de
+/// propósito: mover coluna escalar de tabela viva é risco que não paga agora — a
+/// unificação, se valer, vem depois).
+/// O ciclo comercial de um precatório, do lado do CLIENTE.
+///
+/// Até o CRM ganhar funil, isto vivia em anotação de texto livre e em etiqueta —
+/// o que nenhum relatório consegue somar. "Quantos dos 250 deste mês viraram
+/// proposta?" não tinha resposta possível.
+enum EstagioCrm {
+  NOVO // chegou no lote e ninguém tocou
+  EM_CONTATO // já houve tentativa de falar com o titular
+  PROPOSTA // proposta de antecipação enviada
+  FECHADO // terminal COM receita
+  PERDIDO // terminal SEM receita — e o motivo é o que diz o que corrigir
+}
+
+enum CanalContato {
+  TELEFONE
+  WHATSAPP
+  EMAIL
+  PRESENCIAL
+  OUTRO
+}
+
+enum ResultadoContato {
+  ATENDEU
+  NAO_ATENDEU
+  NUMERO_ERRADO
+  RECADO
+  RECUSOU
+}
+
+/// Uma TENTATIVA de contato com o titular de um processo.
+///
+/// Estruturado, e não texto livre, porque a pergunta que ele existe para
+/// responder é de contagem: quantas ligações até uma proposta, quantos números
+/// errados, quem ainda não foi tocado.
+///
+/// ⚠ NÃO tem `pessoaId`, e é deliberado. O vínculo é com o PROCESSO, como em
+/// AnotacaoProcesso. Ligar o contato ao titular criaria um ponto novo de dado
+/// pessoal, e a fronteira da exclusão do titular (B9) foi desenhada e
+/// documentada sem ele — quem é o titular já se responde pelas partes do
+/// processo.
+model ContatoProcesso {
+  id             String @id @default(uuid()) @db.Uuid
+  processoId     String @db.Uuid
+  organizationId String @db.Uuid
+  autorId        String @db.Uuid
+
+  canal      CanalContato     @default(TELEFONE)
+  resultado  ResultadoContato
+  observacao String?
+
+  criadoEm DateTime @default(now())
+
+  processo     Processo     @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  /// RESTRICT como na anotação: o contato é registro de trabalho, e sumir com o
+  /// autor apagaria de quem foi a tentativa.
+  autor        User         @relation(fields: [autorId], references: [id], onDelete: Restrict)
+
+  @@index([processoId, criadoEm(sort: Desc)])
+  @@index([organizationId, criadoEm(sort: Desc)])
+  @@index([autorId])
+  @@map("contatos_processo")
+}
+
+/// Como se negocia um precatório. Os dois caminhos são exclusivos entre si.
+enum ModalidadeNegociacao {
+  CESSAO /// o escritório COMPRA o crédito com deságio — grava-se a quantia
+  HONORARIOS /// representa e fica com um % do que o titular receber — grava-se o %
+}
+
+/// Quem pôs o número na mesa. É o que faz a CONTRAPROPOSTA existir como dado,
+/// em vez de virar frase perdida numa observação que nenhum relatório soma.
+enum OrigemProposta {
+  ESCRITORIO
+  TITULAR
+}
+
+enum StatusProposta {
+  RASCUNHO /// ainda não apresentada — a ÚNICA que pode ser editada
+  ENVIADA /// apresentada ao titular; a partir daqui é imutável
+  ACEITA
+  RECUSADA
+  SUBSTITUIDA /// veio outra rodada por cima
+  CANCELADA /// o escritório retirou a oferta
+}
+
+enum ParteQuePaga {
+  ESCRITORIO
+  TITULAR
+}
+
+/// De onde saiu a base de cálculo. Sai IMPRESSO na folha: é o que impede alguém
+/// de negociar sobre o número errado sem perceber.
+enum OrigemDaBase {
+  PARTE_UNICA
+  SOMA_DAS_PARTES
+  MANUAL
+}
+
+/// Uma RODADA de negociação sobre um precatório.
+///
+/// ── POR QUE RODADA, E NÃO UM CAMPO DE VALOR ──
+///
+/// "Ajustar" uma proposta já apresentada não sobrescreve: cria a rodada
+/// seguinte, e a anterior vira SUBSTITUIDA. Sem isso, a contraproposta do
+/// titular desaparece — e é justamente ela que explica por que o negócio fechou
+/// naquele número. Um campo só guardaria o fim da história sem o meio.
+///
+/// ── POR PROCESSO, E NÃO POR TITULAR ──
+///
+/// Decisão do dono. A consequência está escrita em titular.service.ts: nos 230
+/// processos com mais de um titular, a exclusão de UM alcança a negociação do
+/// processo inteiro. É o lado seguro do erro, e não uma distração.
+model PropostaNegociacao {
+  id             String @id @default(uuid()) @db.Uuid
+  processoId     String @db.Uuid
+  /// Tenant DONO da rodada: isola a oferta do escritório A da do B sobre o
+  /// MESMO precatório liberado aos dois. Não há exclusividade de processos.
+  organizationId String @db.Uuid
+  autorId        String @db.Uuid
+
+  rodada     Int
+  origem     OrigemProposta       @default(ESCRITORIO)
+  modalidade ModalidadeNegociacao
+  status     StatusProposta       @default(RASCUNHO)
+
+  /// RETRATO da base no dia da rodada. Sem ele, uma reimportação que corrigisse
+  /// o valor reescreveria o deságio de uma proposta de março, em silêncio.
+  baseValor  Decimal?      @db.Decimal(15, 2)
+  baseOrigem OrigemDaBase?
+
+  /// CESSÃO: a QUANTIA oferecida. O deságio é conta contra `baseValor` — gravar
+  /// o percentual faria uma correção de planilha mudar quanto o sistema diz que
+  /// oferecemos.
+  valorProposto       Decimal? @db.Decimal(15, 2)
+  /// HONORÁRIOS: o percentual é o fato; a quantia só existe quando o tribunal
+  /// pagar, e gravá-la seria projeção disfarçada de dinheiro.
+  honorarioPercentual Decimal? @db.Decimal(5, 2)
+
+  custasEstimadas  Decimal?     @db.Decimal(15, 2)
+  custasPorContaDe ParteQuePaga @default(ESCRITORIO)
+
+  /// DATE, não timestamp: validade é DIA. Como timestamp, a proposta venceria em
+  /// horas diferentes conforme o fuso de quem abre a tela.
+  validaAte DateTime? @db.Date
+
+  /// ÚNICA superfície de texto livre — e por isso apagável de verdade na
+  /// exclusão do titular, nunca um EventoProcesso.
+  observacao String?
+
+  enviadaEm       DateTime?
+  respondidaEm    DateTime?
+  respondidaPorId String?   @db.Uuid
+  /// Encerramento que NÃO é decisão do titular (substituída, cancelada). Sem
+  /// esta coluna essas transições ficariam sem "quando", porque `editadoEm` é
+  /// sobrescrito por qualquer escrita posterior.
+  encerradaEm     DateTime?
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  processo      Processo     @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  organization  Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  /// RESTRICT como na anotação e no contato: oferta é palavra dada por alguém, e
+  /// sumir com o usuário apagaria de quem ela foi.
+  autor         User         @relation("PropostasFeitas", fields: [autorId], references: [id], onDelete: Restrict)
+  respondidaPor User?        @relation("PropostasRespondidas", fields: [respondidaPorId], references: [id], onDelete: SetNull)
+
+  @@unique([organizationId, processoId, rodada])
+  @@index([processoId, organizationId, criadoEm(sort: Desc)])
+  @@index([organizationId, status, respondidaEm])
+  @@index([autorId])
+  /// ⚠ AS DUAS TRAVAS DE VERDADE NÃO ESTÃO AQUI: `ux_proposta_viva` e
+  /// `ux_proposta_aceita` são índices PARCIAIS, criados no SQL da migration
+  /// 20260811190000_negociacao. O Prisma não tem sintaxe para eles e NÃO OS
+  /// ENXERGA — perder um é perder a trava contra duas propostas vivas no mesmo
+  /// processo, que é dinheiro contado duas vezes. Há teste de integração que
+  /// grava direto no banco esperando a violação. Ver docs/MIGRATIONS.md.
+  parcelas ParcelaCessao[]
+
+  @@map("propostas_negociacao")
+}
+
+/// Uma PARCELA do que o escritório paga ao titular pela cessão.
+///
+/// ── O QUE ELA NÃO GUARDA ──
+///
+/// Não há valor pago diferente do previsto, meio de pagamento, comprovante nem
+/// status. A lista completa de recusas, com o motivo de cada uma, está no SQL da
+/// migration 20260811230000_parcelamento_cessao — e está lá, e não aqui, porque
+/// é lá que alguém vai olhar antes de acrescentar uma coluna.
+///
+/// "Vencida" é `vencimento < hoje`, calculado na leitura. Estado gravado pediria
+/// um cron para mantê-lo, e vencida aqui não dispara NADA: não bloqueia cliente,
+/// não suspende assinatura, não cobra ninguém.
+model ParcelaCessao {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// O CONTRATO. Pendura na proposta porque `ux_proposta_aceita` já garante uma
+  /// aceita por (org, processo) — o pai identifica o contrato sem ambiguidade.
+  propostaId String @db.Uuid
+  /// Desnormalizados para toda escrita poder filtrar por id + processo + org,
+  /// como o resto do CRM faz desde a Etapa 0.
+  processoId     String @db.Uuid
+  organizationId String @db.Uuid
+
+  /// 0 é a ENTRADA; 1..N são as parcelas. Um ordinal só: uma coluna de entrada à
+  /// parte daria dois caminhos de baixa, cada um com sua corrida e sua soma.
+  numero Int
+  valor  Decimal @db.Decimal(15, 2)
+  /// DATE: vencimento é DIA, não instante.
+  vencimento DateTime @db.Date
+
+  pagoEm    DateTime?
+  pagoPorId String?   @db.Uuid
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  proposta     PropostaNegociacao @relation(fields: [propostaId], references: [id], onDelete: Cascade)
+  processo     Processo           @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  /// SetNull, e não Restrict como o autor da proposta: o FATO da baixa sobrevive
+  /// à saída do usuário; some só o "quem".
+  pagoPor      User?              @relation("BaixasDeParcela", fields: [pagoPorId], references: [id], onDelete: SetNull)
+
+  /// A chave natural — e esta o Prisma ENXERGA, ao contrário das duas travas
+  /// parciais da proposta. É ela que faz "gerar o cronograma duas vezes" virar
+  /// 409 legível em vez de catorze parcelas.
+  @@unique([propostaId, numero])
+  @@index([organizationId, vencimento])
+  @@index([processoId])
+  @@index([pagoPorId])
+  @@map("parcelas_cessao")
+}
+
+model CarteiraProcesso {
+  organizationId String             @db.Uuid
+  processoId     String             @db.Uuid
+  prioridade     PrioridadeProcesso @default(NORMAL)
+  responsavelId  String?            @db.Uuid
+
+  /// ── O funil, no OVERLAY e não no processo ──
+  /// O mesmo precatório pode estar em estágios diferentes para dois escritórios
+  /// que o receberam: não há exclusividade, e o funil é de cada um.
+  estagio     EstagioCrm @default(NOVO)
+  /// Quando o estágio mudou. É daqui que sai "parado há 12 dias" — a pergunta
+  /// que separa um funil vivo de uma lista de intenções.
+  estagioEm   DateTime?
+  /// Livre, e não enum: o motivo real varia mais do que qualquer lista aguenta
+  /// ("titular faleceu", "já cedeu para outro", "achou pouco"), e engessá-lo
+  /// faria todo mundo escolher "Outro".
+  motivoPerda String?
+
+  /// Último contato registrado. DENORMALIZADO de propósito: a fila filtra
+  /// "ainda sem contato" e ordena por "quem está há mais tempo sem ser tocado"
+  /// sobre milhares de linhas. Escrito na MESMA transação do contato.
+  ultimoContatoEm DateTime?
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  processo     Processo     @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  responsavel  User?        @relation("CarteiraResponsavel", fields: [responsavelId], references: [id], onDelete: SetNull)
+
+  @@id([organizationId, processoId])
+  /// A fila de trabalho do cliente: "meus urgentes primeiro", já escopada à org.
+  @@index([organizationId, responsavelId, prioridade])
+  /// A fila de trabalho varre por estágio e por quem está sem contato.
+  @@index([organizationId, estagio, prioridade])
+  @@index([organizationId, ultimoContatoEm])
+  @@index([processoId])
+  @@map("carteira_processo")
+}
+
+enum StatusFatura {
+  ABERTA // emitida, aguardando pagamento
+  PAGA
+  VENCIDA // passou do vencimento sem baixa
+  CANCELADA
+  ESTORNADA
+}
+
+/// Uma cobrança por ciclo da assinatura.
+///
+/// `@@unique(assinatura, competência)` torna a emissão IDEMPOTENTE — o cron roda
+/// todo dia sem gerar duas faturas do mesmo mês, exatamente como o lote de
+/// distribuição. É o mesmo truque, pela mesma razão.
+model Fatura {
+  id           String       @id @default(uuid()) @db.Uuid
+  assinaturaId String       @db.Uuid
+  competencia  DateTime     @db.Date
+  valor        Decimal      @db.Decimal(12, 2)
+  status       StatusFatura @default(ABERTA)
+
+  /// @db.Date: vencimento é DIA. Timestamp faria a fatura vencer em horas
+  /// diferentes conforme o fuso de quem olha — e vencimento errado suspende
+  /// cliente adimplente.
+  vencimentoEm DateTime  @db.Date
+  pagoEm       DateTime?
+
+  /// Id da cobrança NO GATEWAY. Nulo no provedor manual. `@unique` porque é por
+  /// ele que o webhook encontra a fatura: dois registros com o mesmo id externo
+  /// fariam um pagamento dar baixa na fatura errada.
+  idExterno    String? @unique
+  urlPagamento String?
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  assinatura Assinatura @relation(fields: [assinaturaId], references: [id], onDelete: Cascade)
+
+  @@unique([assinaturaId, competencia])
+  /// O cron de vencimento: "abertas que já passaram do dia".
+  @@index([status, vencimentoEm])
+  @@map("faturas")
+}
+
+/// Evento recebido do gateway, gravado ANTES de ser aplicado.
+///
+/// `idExterno @unique` é a idempotência do webhook — e não é luxo: gateway
+/// reenvia evento quando não recebe 200 a tempo, e aplicar "pagamento
+/// confirmado" duas vezes reativaria uma assinatura que o cliente cancelou no
+/// meio. Guardar o payload CRU é o que permite reprocessar um evento cuja
+/// interpretação estava errada, sem depender de reenvio do gateway.
+model EventoCobranca {
+  id        String @id @default(uuid()) @db.Uuid
+  provedor  String
+  idExterno String @unique
+  tipo      String
+  payload   Json
+
+  processadoEm DateTime?
+  erro         String?
+  criadoEm     DateTime  @default(now())
+
+  @@index([tipo, criadoEm(sort: Desc)])
+  @@map("eventos_cobranca")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  DOMÍNIO — PESSOAS (TITULARES)
+// ═══════════════════════════════════════════════════════════════════
+
+enum StatusEnriquecimento {
+  PENDENTE // nunca consultado
+  SINCRONIZADO // consultado com sucesso
+  SEM_DADOS // provider respondeu, mas não achou nada
+  ERRO // falhou; ver Enriquecimento mais recente
+
+  /// Titular pediu exclusão (LGPD art. 18). Estado TERMINAL: a fila seleciona
+  /// por `statusEnriquecimento IN (...)` e este valor não entra em nenhuma
+  /// lista, então a pessoa fica de fora sozinha. Falha fechada de propósito —
+  /// uma consulta nova precisa incluí-lo para voltar a enriquecê-lo.
+  EXCLUIDO
+}
+
+model Pessoa {
+  id  String @id @default(uuid()) @db.Uuid
+  /// Somente dígitos. Normalizado na entrada — é a chave natural de deduplicação.
+  cpf String @unique @db.VarChar(11)
+
+  nome            String
+  /// Maiúsculo, sem acento, espaços colapsados. Usado na busca por nome (trigram).
+  nomeNormalizado String
+
+  dataNascimento    DateTime?
+  nomeMae           String?
+  situacaoCadastral String?
+  obito             Boolean   @default(false)
+
+  statusEnriquecimento StatusEnriquecimento @default(PENDENTE)
+  /// Veredito da comparação entre o nome da planilha e o do titular do CPF.
+  /// Ver a nota do enum. Padrão: ninguém conferiu ainda.
+  conferenciaNome ConferenciaNome @default(NAO_CONFERIDO)
+  ultimaSincronizacao  DateTime?
+
+  /// ── Exclusão a pedido do titular (LGPD art. 18, VI) ──
+  /// Preenchido = o pedido foi atendido. É a prova que se mostra à ANPD, e a
+  /// razão de `statusEnriquecimento` estar em EXCLUIDO.
+  exclusaoEm     DateTime?
+  exclusaoMotivo String?
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  telefones      Telefone[]
+  emails         Email[]
+  enderecos      Endereco[]
+  enriquecimento Enriquecimento[]
+  processos      ProcessoPessoa[]
+
+  @@index([nomeNormalizado])
+  @@index([statusEnriquecimento, ultimaSincronizacao])
+  @@map("pessoas")
+}
+
+enum TipoTelefone {
+  MOVEL
+  FIXO
+  DESCONHECIDO
+}
+
+/// 1:N — uma pessoa tem vários telefones. `primeiraVez/ultimaVez` mostram
+/// quando o dado apareceu e quando foi visto pela última vez numa sincronização.
+model Telefone {
+  id       String       @id @default(uuid()) @db.Uuid
+  pessoaId String       @db.Uuid
+  ddd      String?      @db.VarChar(3)
+  numero   String       @db.VarChar(15)
+  tipo     TipoTelefone @default(DESCONHECIDO)
+  whatsapp Boolean?
+  /// Score de confiabilidade do provider.
+  ///
+  /// ⚠ NÃO É MAIS GRAVADO — minimização (LGPD art. 6º, III). A investigação de
+  /// 23/08/2026 varreu o repositório inteiro: nada lia este número. Não ordenava
+  /// a lista de contatos (a ordem é por `ultimaVez`), não filtrava, não aparecia
+  /// em tela e não tinha um único teste. Coletar dado que ninguém usa é coleta
+  /// sem finalidade demonstrada.
+  ///
+  /// A COLUNA fica, e de propósito: apagá-la é irreversível, e o histórico só
+  /// voltaria repetindo consulta PAGA ao provedor. Quem quiser zerar o estoque
+  /// roda um UPDATE — decisão de negócio, não de schema.
+  score    Int?
+  origem   String       @default("CONTACTRA")
+  ativo    Boolean      @default(true)
+
+  primeiraVez DateTime @default(now())
+  ultimaVez   DateTime @default(now())
+
+  pessoa Pessoa @relation(fields: [pessoaId], references: [id], onDelete: Cascade)
+
+  @@unique([pessoaId, ddd, numero])
+  @@index([pessoaId])
+  /// ⚠ AQUI FALTA UM ÍNDICE, E A FALTA É PROPOSITAL.
+  ///
+  /// Existia `@@index([numero])`. Um índice serve a UMA pergunta, e a pergunta
+  /// que este respondia era "de quem é este número?" — busca reversa sobre a
+  /// base nacional inteira, instantânea, sem recorte de organização.
+  ///
+  /// Nenhuma tela, rota ou relatório faz essa pergunta: quem digita número na
+  /// busca está procurando CPF. Era capacidade montada e pronta para uma
+  /// finalidade que o produto não tem — exatamente o que o art. 6º, III proíbe.
+  ///
+  /// A deduplicação de telefone no enriquecimento NÃO depende dele: ela usa
+  /// `@@unique([pessoaId, ddd, numero])`, que continua de pé. Se algum dia
+  /// nascer uma consulta legítima por número, o índice volta em uma linha.
+  @@map("telefones")
+}
+
+model Email {
+  id       String  @id @default(uuid()) @db.Uuid
+  pessoaId String  @db.Uuid
+  endereco String
+  /// ⚠ NÃO É MAIS GRAVADO — mesma razão de `Telefone.score`, ver lá.
+  score    Int?
+  origem   String  @default("CONTACTRA")
+  ativo    Boolean @default(true)
+
+  primeiraVez DateTime @default(now())
+  ultimaVez   DateTime @default(now())
+
+  pessoa Pessoa @relation(fields: [pessoaId], references: [id], onDelete: Cascade)
+
+  @@unique([pessoaId, endereco])
+  @@index([pessoaId])
+  @@map("emails")
+}
+
+model Endereco {
+  id          String  @id @default(uuid()) @db.Uuid
+  pessoaId    String  @db.Uuid
+  logradouro  String?
+  numero      String?
+  complemento String?
+  bairro      String?
+  cidade      String?
+  uf          String? @db.VarChar(2)
+  cep         String? @db.VarChar(8)
+  tipo        String?
+  origem      String  @default("CONTACTRA")
+  ativo       Boolean @default(true)
+
+  primeiraVez DateTime @default(now())
+  ultimaVez   DateTime @default(now())
+
+  pessoa Pessoa @relation(fields: [pessoaId], references: [id], onDelete: Cascade)
+
+  @@index([pessoaId])
+  @@index([uf, cidade]) // filtro de busca do cliente
+  @@index([cep])
+  @@map("enderecos")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  DOMÍNIO — PROCESSOS (PRECATÓRIOS)
+// ═══════════════════════════════════════════════════════════════════
+
+enum EsferaTribunal {
+  FEDERAL
+  ESTADUAL
+  TRABALHISTA
+  SUPERIOR
+}
+
+/// Catálogo de tribunais.
+///
+/// Substitui o campo texto `tribunal` com default "TRF5", que fixava um único
+/// tribunal no núcleo do sistema. Entidade própria porque o tribunal vai
+/// carregar configuração — perfil de importação, endpoint de consulta — e
+/// string solta não tem onde pendurar isso.
+model Tribunal {
+  id            String         @id @default(uuid()) @db.Uuid
+  /// Normalizada em caixa alta, sem hífen: TRF1..TRF6.
+  sigla         String         @unique @db.VarChar(12)
+  nome          String
+  esfera        EsferaTribunal @default(FEDERAL)
+  /// UFs sob jurisdição. NÃO é o filtro de UF da busca, que é do endereço.
+  ufsJurisdicao String[]       @db.VarChar(2)
+  ativo         Boolean        @default(true)
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  processos   Processo[]
+  perfis      PerfilImportacao[]
+  importacoes Importacao[]
+
+  @@map("tribunais")
+}
+
+/// Como ler a planilha de um tribunal.
+///
+/// Sem isto, `COLUNAS` era constante única de módulo com o alias literal
+/// "número do processo de precatório no trf5". Uma planilha do TRF1 com
+/// cabeçalho diferente importava "com sucesso" e zero linhas — ou pior:
+/// reconhecia os CPFs, não reconhecia os processos, e a fila queimava crédito
+/// da Contactra em milhares de pessoas que ficariam invisíveis nos agregados.
+model PerfilImportacao {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// O tribunal a que este perfil serve — ou NULO, e aí ele serve a todos.
+  ///
+  /// ── POR QUE PASSOU A ACEITAR NULO ──
+  ///
+  /// Até 04/09/2026 toda planilha vinha de UM tribunal, escolhido na tela antes
+  /// de o arquivo ser aberto. A de pré-precatórios traz 42 num arquivo só, com o
+  /// tribunal numa COLUNA — e um perfil preso a um tribunal não tem como ler
+  /// isso.
+  ///
+  /// Nulo aqui significa "o tribunal vem da linha". É a única diferença entre os
+  /// dois modos, e ela é explícita: o perfil declara o que sabe ler.
+  tribunalId String? @db.Uuid
+
+  nome String
+
+  /// { campoInterno: ["alias acatado", ...] }. Aliases são normalizados
+  /// (minúsculo, sem acento, sem separador) antes da comparação.
+  mapaColunas         Json
+  /// Campos internos sem os quais a importação FALHA em vez de seguir vazia.
+  colunasObrigatorias String[]
+  /// Nome da aba do .xlsx. Nulo = primeira aba.
+  aba                 String?
+
+  ativo     Boolean  @default(true)
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  tribunal    Tribunal?     @relation(fields: [tribunalId], references: [id], onDelete: Cascade)
+  importacoes Importacao[]
+
+  /// ⚠ NO POSTGRES, ESTE ÚNICO NÃO ALCANÇA OS PERFIS MULTI-TRIBUNAL.
+  ///
+  /// Índice único trata cada NULO como distinto, então dois perfis sem tribunal
+  /// com o mesmo nome não colidiriam aqui. A trava para esses é outra e está na
+  /// migration: um índice parcial sobre `nome` onde `tribunalId IS NULL`.
+  @@unique([tribunalId, nome])
+  @@index([tribunalId, ativo])
+  @@map("perfis_importacao")
+}
+
+model Processo {
+  id                 String  @id @default(uuid()) @db.Uuid
+  /// NÃO é único sozinho — ver @@unique com tribunalId no fim do modelo.
+  numeroPrecatorio   String
+  numeroOriginario   String?
+  numeroRequisitorio String?
+
+  tribunalId String   @db.Uuid
+  tribunal   Tribunal @relation(fields: [tribunalId], references: [id])
+
+  /// Fronteira de tenancy da carteira. Pessoa continua global (a chave natural
+  /// é o documento, e escopá-la partiria a trilha do art. 18 da LGPD); é o
+  /// processo que pertence a uma organização.
+  organizationId String       @db.Uuid
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  /// EM QUE PONTO DO CAMINHO este processo está.
+  ///
+  /// Até 04/09/2026 a base era só de precatórios já expedidos e na fila
+  /// orçamentária — a planilha de dívida consolidada dos TRFs. Com os
+  /// PRÉ-PRECATÓRIOS, a mesma tabela passa a guardar oportunidades que ainda não
+  /// viraram precatório, e sem esta coluna não haveria como distinguir um valor
+  /// exigível de um que talvez nunca venha a ser.
+  ///
+  /// ⚠ OBRIGATÓRIA E SEM DEFAULT, de propósito. Um default tornaria a fase um
+  /// palpite silencioso em todo `create` que a esquecesse — e como a fase decide
+  /// o que é distribuído (ver FASES_DISTRIBUIVEIS), o palpite viraria venda. Sem
+  /// default, quem cria processo é obrigado a declarar o estágio, e o TypeScript
+  /// recusa quem não declarar.
+  fase FaseProcesso
+
+  /// Nulo = distribuível. Preenchido = o MOTIVO de o processo ficar na base mas
+  /// fora do sorteio. Não apaga nada e não é retroativo: o que já foi liberado
+  /// continua com quem recebeu. Lido por PROCESSO_DISTRIBUIVEL e pelo gêmeo em
+  /// SQL cru de `sortear()`. Ver a nota do enum.
+  foraDaDistribuicao MotivoForaDaDistribuicao?
+
+  vara             String?
+  entidadeDevedora String?
+  natureza         String? // alimentar / comum
+  situacao         String?
+
+  /// Valor total do precatório. O valor por pessoa fica em ProcessoPessoa.
+  valor        Decimal?  @db.Decimal(15, 2)
+
+  /// Valor INDICATIVO — extraído de texto, não de campo estruturado.
+  ///
+  /// ── POR QUE NÃO ENTRA EM `valor` ──
+  ///
+  /// A planilha de pré-precatórios documenta a própria procedência: "NENHUMA
+  /// fonte pública tem campo de valor. Todo número foi extraído do texto (…) é
+  /// palpite — pode ser honorário, custas ou valor da causa."
+  ///
+  /// `valor` é somado no ranking por entidade devedora, no dashboard e na
+  /// calculadora de negociação — lugares onde ninguém mais duvida do número.
+  /// Misturar palpite com valor apurado ali contamina agregado que o cliente usa
+  /// para decidir, e não haveria como separar depois.
+  ///
+  /// Coluna própria mantém o dado (ele é útil: ordena por magnitude) e mantém a
+  /// dúvida junto dele. A tela mostra de onde veio.
+  valorIndicativo Decimal? @db.Decimal(15, 2)
+  dataAutuacao DateTime?
+  exercicio    Int? // ano orçamentário (ex.: 2027)
+  fonte        String?
+
+  /// ── Estado do CRM ──
+  ///
+  /// Mantido pelo OPERADOR, não pela planilha. A importação não tem como
+  /// sobrescrevê-los: `calcularDelta` só aceita chave presente em
+  /// CAMPOS_LOGAVEIS e estoura em qualquer outra, então uma coluna nova chamada
+  /// "prioridade" numa planilha do TRF1 faria a importação FALHAR, não
+  /// atropelar em silêncio o que a equipe classificou à mão.
+  prioridade    PrioridadeProcesso @default(NORMAL)
+  responsavelId String?            @db.Uuid
+  responsavel   User?              @relation("ProcessosSobResponsabilidade", fields: [responsavelId], references: [id], onDelete: SetNull)
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  partes     ProcessoPessoa[]
+  eventos    EventoProcesso[]
+  anotacoes      AnotacaoProcesso[]
+  contatos       ContatoProcesso[]
+  propostas     PropostaNegociacao[]
+  parcelas      ParcelaCessao[]
+  etiquetas  ProcessoEtiqueta[]
+  tarefas    TarefaProcesso[]
+  liberacoes ProcessoLiberado[]
+  carteira   CarteiraProcesso[]
+
+  /// Identidade real do precatório: o número só é único DENTRO do tribunal.
+  ///
+  /// Antes era `numeroPrecatorio @unique` global. Como os dois upserts usam
+  /// esse campo como chave e ambos fazem `update: {}`, um número do TRF1 que
+  /// colidisse com um do TRF5 faria o upsert ENCONTRAR o processo do TRF5,
+  /// não atualizar nada, e vincular a parte do TRF1 ao processo errado — sem
+  /// erro e sem log, impossível de distinguir depois.
+  @@unique([tribunalId, numeroPrecatorio])
+  /// Fila de trabalho: "meus processos urgentes primeiro" é a leitura que abre
+  /// o dia do operador, e sem índice ela varre os 4.188.
+  @@index([organizationId, responsavelId, prioridade])
+  @@index([numeroOriginario])
+  @@index([numeroRequisitorio])
+  @@index([entidadeDevedora])
+  @@index([exercicio])
+  @@index([organizationId, tribunalId, exercicio])
+  /// O sorteio mensal passou a filtrar por fase, e ele varre a base com
+  /// ORDER BY random(). Composto com `organizationId` porque é assim que a
+  /// consulta é escrita — primeiro o recorte da organização interna, depois a
+  /// fase. Um índice só de `fase` teria seletividade baixa demais para valer.
+  @@index([organizationId, fase])
+  @@map("processos")
+}
+
+enum PapelProcessual {
+  REQUERENTE
+  EXEQUENTE
+  CESSIONARIO
+  ESPOLIO
+  OUTRO
+}
+
+/// N:N. Na coleta do TRF5 apareceram processos com 84 partes —
+/// modelar como 1:1 quebraria na primeira importação real.
+model ProcessoPessoa {
+  processoId String          @db.Uuid
+  pessoaId   String          @db.Uuid
+  papel      PapelProcessual @default(REQUERENTE)
+
+  /// Valor que cabe a esta pessoa neste processo.
+  valorIndividual Decimal? @db.Decimal(15, 2)
+  observacoes     String?
+
+  criadoEm DateTime @default(now())
+
+  processo Processo @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  pessoa   Pessoa   @relation(fields: [pessoaId], references: [id], onDelete: Cascade)
+
+  @@id([processoId, pessoaId])
+  @@index([pessoaId])
+  @@map("processo_pessoas")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TIMELINE DO PROCESSO — append-only
+// ═══════════════════════════════════════════════════════════════════
+
+enum TipoEventoProcesso {
+  IMPORTADO // processo criado do zero por uma importação/seed
+  DADO_ATUALIZADO // reimportação corrigiu campo(s) não pessoal(is)
+  ENRIQUECIDO // sincronização trouxe dado novo de alguma parte
+  STATUS_ALTERADO // mudança de situação/fase acompanhada manualmente
+  OBSERVACAO // anotação escrita por um operador
+  ACESSO_CLIENTE // cliente abriu o processo na consulta
+}
+
+/// Linha do tempo do processo — é o que dá vida ao CRM.
+///
+/// Nasceu junto com a troca dos upserts `update: {}` por diff-and-update. Enquanto
+/// a reimportação não alterava campo algum, DADO_ATUALIZADO seria um enum que nunca
+/// receberia linha e a timeline nasceria morta: só IMPORTADO, uma vez, e nada mais.
+///
+/// Regra de volume: UM evento por processo por execução, nunca um por campo — os
+/// campos que mudaram vão juntos em `camposAlterados`. Com 4.188 processos e ~9
+/// campos diffáveis, um evento por campo transformaria uma reimportação de rotina
+/// em dezenas de milhares de linhas e a tela do processo ficaria ilegível.
+///
+/// ⚠ LGPD — `camposAlterados` e `detalhe` só podem conter campos NÃO pessoais do
+/// Processo (valor, situação, entidade devedora, natureza, vara, exercício, datas,
+/// números). NUNCA nome, CPF, telefone, e-mail ou endereço: este log é append-only
+/// e uma SolicitacaoTitular de EXCLUSÃO não teria como apagá-lo. A trava que garante
+/// isso é a lista de campos proibidos em timeline-processo.ts, verificada em runtime.
+model EventoProcesso {
+  id         String             @id @default(uuid()) @db.Uuid
+  processoId String             @db.Uuid
+  tipo       TipoEventoProcesso
+  descricao  String
+
+  /// Nomes dos campos que mudaram nesta execução. Vazio em IMPORTADO/OBSERVACAO.
+  camposAlterados String[]
+  /// { campo: { de, para } } — só de campos não pessoais. Nulo quando não há diff.
+  detalhe         Json?
+
+  /// Origem do evento. Escalares soltos de propósito, sem FK: o log precisa
+  /// sobreviver à remoção de uma Importacao ou de um User. Mesmo padrão de
+  /// ImportacaoLinha.pessoaId/processoId. `processoId` tem FK porque um evento
+  /// sem processo não significa nada — daí o Cascade.
+  importacaoId String? @db.Uuid
+  userId       String? @db.Uuid
+
+  /// Visibilidade do evento. NULL = fato do processo, visível a toda org que o
+  /// tenha liberado (IMPORTADO, DADO_ATUALIZADO, ENRIQUECIDO). Preenchido =
+  /// privado daquela org (mudança de prioridade/responsável do time interno).
+  organizationId String? @db.Uuid
+
+  criadoEm DateTime @default(now())
+
+  processo     Processo      @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([processoId, criadoEm(sort: Desc)])
+  @@index([tipo, criadoEm(sort: Desc)])
+  @@index([importacaoId])
+  @@index([organizationId])
+  @@map("eventos_processo")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CRM — estado mantido pela equipe (editável e APAGÁVEL)
+// ═══════════════════════════════════════════════════════════════════
+
+enum PrioridadeProcesso {
+  BAIXA
+  NORMAL
+  ALTA
+  URGENTE
+}
+
+/// O estágio do processo no caminho até virar dinheiro.
+///
+/// A ordem da declaração é a ordem CRONOLÓGICA, e não é enfeite: é por ela que
+/// se lê, olhando uma linha, o quanto ainda falta. Os quatro primeiros vêm da
+/// planilha de pré-precatórios; o último é o que a base inteira era até
+/// 04/09/2026.
+///
+/// ⚠ Acrescentar valor aqui NÃO o torna distribuível: `FASES_DISTRIBUIVEIS`, no
+/// serviço de distribuição, é uma lista de permissão explícita. Fase nova nasce
+/// de fora do sorteio até alguém decidir o contrário — e é esse o ponto.
+/// O nome da planilha bate com o de quem realmente tem o CPF?
+///
+/// Existe porque nos pré-precatórios o CPF é EXTRAÍDO DE TEXTO: dígito
+/// verificador válido prova que o número é bem formado, não que seja daquele
+/// credor. A Contactra devolve o nome do titular real, e o enriquecimento — que
+/// já é pago — passou a comparar os dois.
+///
+/// ⚠ O nome do provedor NÃO é guardado. Guardá-lo dobraria a superfície de dado
+/// pessoal e daria à exclusão do titular mais um lugar para alcançar. O veredito
+/// basta: é ele que a tela mostra e é ele que diz se a abordagem é segura.
+enum ConferenciaNome {
+  /// Ainda não houve enriquecimento com nome, ou a fonte não devolveu nome.
+  NAO_CONFERIDO
+  /// Primeiro nome e ao menos um sobrenome batem.
+  CONFERE
+  /// ⚠ O CPF provavelmente NÃO é desta pessoa. Não aborde sem conferir.
+  DIVERGE
+}
+
+enum FaseProcesso {
+  /// Ganhou e não cabe mais recurso. Ainda não há valor apurado.
+  TRANSITO_EM_JULGADO
+  /// A conta foi feita e aceita pelo juízo. Há valor, não há requisição.
+  CALCULOS_HOMOLOGADOS
+  /// O juízo requisitou o pagamento ao tribunal. Vira `numeroRequisitorio`.
+  REQUISITORIO_EXPEDIDO
+  /// O tribunal autuou o precatório. A partir daqui existe número de precatório.
+  PRECATORIO_AUTUADO
+  /// Precatório na fila orçamentária — o que a dívida consolidada dos TRFs traz.
+  PRECATORIO_EXPEDIDO
+}
+
+/// Por que um processo fica na base mas não vai ao sorteio.
+///
+/// Enum e não booleano: a próxima razão de segurar um processo entra com nome
+/// próprio, em vez de reaproveitar uma marca que dizia outra coisa.
+enum MotivoForaDaDistribuicao {
+  /// O devedor não é a Fazenda Pública — banco, empresa, reclamação trabalhista
+  /// contra particular. Marcados 1.050 dos radares de 16–30/09 na reavaliação de
+  /// 03/10/2026, quando a regra de devedor do radar foi corrigida (às cegas:
+  /// filtro de 78% para 97%). O radar novo já não os coleta.
+  DEVEDOR_NAO_E_FAZENDA
+}
+
+/// Anotação livre da equipe sobre o processo.
+///
+/// ⚠ POR QUE TABELA PRÓPRIA, e não um EventoProcesso com tipo OBSERVACAO:
+/// anotação é texto livre, e texto livre de escritório de advocacia contém dado
+/// pessoal — "ligar para a filha no 81 9xxxx-xxxx", "cliente internado no
+/// Hospital X". EventoProcesso é append-only por desenho, e uma
+/// SolicitacaoTitular de EXCLUSAO não teria como apagá-lo. Aqui a linha é
+/// editável e removível de verdade, que é o que o art. 18 da LGPD exige.
+///
+/// Consequência: OBSERVACAO continua no enum TipoEventoProcesso e NÃO deve ser
+/// usada para anotação de operador — usá-la reabriria exatamente o buraco que
+/// esta tabela existe para fechar. A timeline da tela junta as duas fontes na
+/// leitura, então a anotação aparece na linha do tempo sem morar nela.
+model AnotacaoProcesso {
+  id         String @id @default(uuid()) @db.Uuid
+  processoId String @db.Uuid
+
+  /// Tenant DONO da anotação = a org de quem escreveu. É o que isola a anotação
+  /// do cliente A da do cliente B (e das do time interno) sobre o mesmo processo.
+  organizationId String @db.Uuid
+
+  /// Autor. Restrict e não Cascade: apagar um usuário não pode evaporar as
+  /// anotações do caso, que são registro de trabalho do escritório.
+  autorId String @db.Uuid
+  autor   User   @relation(fields: [autorId], references: [id], onDelete: Restrict)
+
+  texto  String
+  /// Fixa no topo — o "leia isto antes de mexer no processo".
+  fixada Boolean @default(false)
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  processo     Processo     @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([processoId, criadoEm(sort: Desc)])
+  @@index([autorId])
+  @@index([organizationId])
+  @@map("anotacoes_processo")
+}
+
+/// Vocabulário de etiquetas da organização.
+///
+/// Entidade própria, e não string solta no processo: com texto livre, "Acordo",
+/// "acordo" e "Acôrdo" viram três etiquetas e o filtro por etiqueta deixa de
+/// fechar. `cor` guarda o NOME de um token do tema (marca-ciano, ok, alerta...),
+/// nunca um hexadecimal — assim a paleta muda num lugar só.
+model Etiqueta {
+  id             String       @id @default(uuid()) @db.Uuid
+  organizationId String       @db.Uuid
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  nome     String
+  cor      String   @default("marca-ciano")
+  criadoEm DateTime @default(now())
+
+  processos ProcessoEtiqueta[]
+
+  /// Impede a duplicata que quebraria o filtro. Case-insensitive de verdade
+  /// exigiria índice funcional; a normalização fica na aplicação.
+  @@unique([organizationId, nome])
+  @@map("etiquetas")
+}
+
+enum TipoTarefa {
+  TAREFA // algo a fazer: protocolar, ligar, juntar documento
+  FOLLOW_UP // lembrete de voltar ao processo numa data
+}
+
+/// Tarefa ou follow-up de um processo.
+///
+/// UMA tabela para os dois porque o ciclo de vida é idêntico — alguém, até uma
+/// data, feito ou não. O que muda é a intenção, e isso é um campo. Duas tabelas
+/// duplicariam índice, rota e tela para carregar um rótulo diferente.
+///
+/// ⚠ Mesmo motivo da AnotacaoProcesso para não virar EventoProcesso: `titulo` é
+/// texto livre de escritório ("cobrar a filha da requerente no 81 9xxxx") e o
+/// log é append-only. Aqui a linha é editável e removível.
+model TarefaProcesso {
+  id         String @id @default(uuid()) @db.Uuid
+  processoId String @db.Uuid
+
+  /// Tenant dono da tarefa = a org de quem criou. Isola o "meu dia" de cada
+  /// cliente e realiza a desnormalização que o índice de minhasTarefas antecipava.
+  organizationId String @db.Uuid
+
+  tipo TipoTarefa @default(TAREFA)
+
+  titulo String
+
+  /// ⚠ `@db.Date` e não timestamp, DE PROPÓSITO.
+  ///
+  /// Prazo é DIA, não instante: "até 25/07" não muda de valor conforme o fuso de
+  /// quem abre a tela. Guardar como timestamp reintroduziria exatamente o bug que
+  /// fazia data de nascimento aparecer um dia antes em Brasília — e aqui seria
+  /// pior, porque um prazo exibido um dia cedo (ou tarde) é perda de prazo.
+  prazo DateTime? @db.Date
+
+  /// Quem deve executar. Null = ninguém assumiu ainda.
+  responsavelId String? @db.Uuid
+  responsavel   User?   @relation("TarefasAtribuidas", fields: [responsavelId], references: [id], onDelete: SetNull)
+
+  /// Quem criou. Restrict pelo mesmo motivo da anotação: apagar um usuário não
+  /// pode evaporar o trabalho combinado do escritório.
+  criadoPorId String @db.Uuid
+  criadoPor   User   @relation("TarefasCriadas", fields: [criadoPorId], references: [id], onDelete: Restrict)
+
+  /// Instante da conclusão — e não um booleano. "Quando foi feito" responde
+  /// perguntas que "se foi feito" não responde, e custa a mesma coluna.
+  concluidaEm DateTime?
+
+  criadoEm  DateTime @default(now())
+  editadoEm DateTime @updatedAt
+
+  processo     Processo     @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  /// A tela do processo: as pendentes primeiro, na ordem do prazo.
+  @@index([processoId, concluidaEm, prazo])
+  /// "O que eu tenho para hoje" — a consulta que abre o dia de cada operador. O
+  /// comentário antigo previa desnormalizar organizationId para cá "se um dia
+  /// precisar"; o multi-tenant chegou, então o índice por responsável convive
+  /// agora com o índice por organização (o "meu dia" do cliente) logo abaixo.
+  @@index([responsavelId, concluidaEm, prazo])
+  /// "Meu dia" do cliente: tudo aberto na carteira dele, na ordem do prazo.
+  @@index([organizationId, concluidaEm, prazo])
+  @@map("tarefas_processo")
+}
+
+model ProcessoEtiqueta {
+  processoId String   @db.Uuid
+  etiquetaId String   @db.Uuid
+  criadoEm   DateTime @default(now())
+
+  processo Processo @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  etiqueta Etiqueta @relation(fields: [etiquetaId], references: [id], onDelete: Cascade)
+
+  @@id([processoId, etiquetaId])
+  @@index([etiquetaId])
+  @@map("processo_etiquetas")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ENRIQUECIMENTO — append-only, versionado
+// ═══════════════════════════════════════════════════════════════════
+
+enum StatusConsulta {
+  SUCESSO
+  SEM_DADOS
+  ERRO
+}
+
+/// Nunca sobrescreve: cada sincronização cria uma versão nova.
+/// `dadosBrutos` guarda o payload íntegro do provider — é o que torna
+/// os campos expansíveis sem migration.
+model Enriquecimento {
+  id       String @id @default(uuid()) @db.Uuid
+  pessoaId String @db.Uuid
+  provider String @default("CONTACTRA")
+  versao   Int
+
+  status        StatusConsulta
+  dadosBrutos   Json?
+  mensagemErro  String?
+  custoCreditos Decimal?       @db.Decimal(10, 4)
+  requestId     String?
+  latenciaMs    Int?
+
+  criadoEm DateTime @default(now())
+
+  pessoa Pessoa @relation(fields: [pessoaId], references: [id], onDelete: Cascade)
+
+  @@unique([pessoaId, provider, versao])
+  @@index([pessoaId, criadoEm(sort: Desc)])
+  @@index([status, criadoEm])
+  @@map("enriquecimentos")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  IMPORTAÇÃO DE PLANILHAS
+// ═══════════════════════════════════════════════════════════════════
+
+enum StatusImportacao {
+  RECEBIDA
+  PROCESSANDO
+  CONCLUIDA
+  CONCLUIDA_COM_ERROS
+  FALHOU
+}
+
+model Importacao {
+  id             String @id @default(uuid()) @db.Uuid
+  organizationId String @db.Uuid
+  userId         String @db.Uuid
+
+  arquivoNome String
+  /// SHA-256 do arquivo — evita reimportar o mesmo conteúdo por engano.
+  arquivoHash String
+  arquivoTipo String // csv | xlsx
+  // `storageKey` foi removido em 23/08/2026: previa um S3 que nunca existiu.
+  // Zero referências em código, teste, seed ou SQL — nenhuma linha jamais a
+  // preencheu. Coluna vazia com nome sugestivo convida a ser usada sem análise.
+
+  /// Destino da carga. Anuláveis porque as importações anteriores ao B5 não têm
+  /// como descobrir o próprio destino retroativamente.
+  ///
+  /// Não é só histórico: com o processamento na FILA, o job carrega apenas o id
+  /// da importação, e é daqui que o worker descobre sob qual tribunal e
+  /// exercício as linhas entram. Antes o destino existia só como argumento em
+  /// memória do serviço.
+  tribunalId String? @db.Uuid
+  exercicio  Int?
+
+  /// O perfil com que ESTA carga foi lida.
+  ///
+  /// ── POR QUE NÃO BASTA GUARDAR O TRIBUNAL ──
+  ///
+  /// O worker relê o destino daqui, e até agora o descobria pelo tribunal: dado
+  /// o tribunal, o perfil ativo mais antigo. Isso deixa de funcionar em dois
+  /// casos, e os dois chegaram juntos:
+  ///
+  ///  1. Carga MULTI-TRIBUNAL não tem tribunal para consultar — ele vem da linha.
+  ///  2. Um tribunal com DOIS perfis ativos (a dívida consolidada antiga e um
+  ///     perfil novo) resolveria sempre para o mais antigo, e o operador não teria
+  ///     como pedir o outro.
+  ///
+  /// Guardando o perfil, a requisição decide UMA vez e o worker obedece. E a
+  /// carga passa a dizer, meses depois, com que mapa de colunas ela foi lida —
+  /// que é a pergunta que se faz quando um número parece errado.
+  perfilId String? @db.Uuid
+
+  status       StatusImportacao @default(RECEBIDA)
+  totalLinhas  Int              @default(0)
+  processadas  Int              @default(0)
+  sucesso      Int              @default(0)
+  falhas       Int              @default(0)
+  ignoradas    Int              @default(0)
+  mensagemErro String?
+
+  /// Resumo do que a carga fez com a carteira.
+  ///
+  /// Vive no banco, e não só na resposta do POST, porque a resposta virou
+  /// "recebi, id tal": o resultado chega minutos depois, por outra rota. É
+  /// deste trio que sai a frase "nenhum processo mudou" — como o operador
+  /// reconhece que reimportar foi inofensivo sem abrir processo a processo.
+  processosCriados     Int @default(0)
+  processosAtualizados Int @default(0)
+  processosInalterados Int @default(0)
+  /// Quantas PESSOAS foram para a fila de enriquecimento (não linhas).
+  enfileirados         Int @default(0)
+
+  iniciadoEm  DateTime?
+  concluidoEm DateTime?
+  criadoEm    DateTime  @default(now())
+
+  organization Organization      @relation(fields: [organizationId], references: [id])
+  user         User              @relation(fields: [userId], references: [id])
+  tribunal     Tribunal?         @relation(fields: [tribunalId], references: [id], onDelete: SetNull)
+  /// `SetNull` como o tribunal: apagar um perfil não pode apagar o histórico de
+  /// cargas feitas com ele. A carga fica, sem saber mais com que mapa foi lida —
+  /// que é pior que saber e melhor que sumir.
+  perfil       PerfilImportacao? @relation(fields: [perfilId], references: [id], onDelete: SetNull)
+  linhas       ImportacaoLinha[]
+
+  @@index([organizationId, criadoEm(sort: Desc)])
+  @@index([status])
+  @@index([arquivoHash])
+  @@map("importacoes")
+}
+
+enum StatusLinha {
+  PENDENTE
+  OK
+  ERRO
+  IGNORADA
+}
+
+model ImportacaoLinha {
+  id           String @id @default(uuid()) @db.Uuid
+  importacaoId String @db.Uuid
+  numeroLinha  Int
+
+  /// Linha crua como veio da planilha — permite reprocessar sem o arquivo.
+  dadosBrutos    Json
+  cpf            String? @db.VarChar(11)
+  numeroProcesso String?
+
+  status       StatusLinha @default(PENDENTE)
+  mensagemErro String?
+  pessoaId     String?     @db.Uuid
+  processoId   String?     @db.Uuid
+
+  criadoEm DateTime @default(now())
+
+  importacao Importacao @relation(fields: [importacaoId], references: [id], onDelete: Cascade)
+
+  @@unique([importacaoId, numeroLinha])
+  @@index([importacaoId, status])
+  @@index([cpf])
+  @@map("importacao_linhas")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FILA / SINCRONIZAÇÃO
+// ═══════════════════════════════════════════════════════════════════
+
+// ── `JobSincronizacao` e `StatusJob` foram REMOVIDOS em 23/08/2026 ──
+//
+// A fila real sempre foi o BullMQ, no Redis. Esta tabela nasceu na migration
+// inicial como uma fila gravada no banco e NUNCA foi ligada: nenhuma linha de
+// código de produção jamais leu ou escreveu nela. Medido em produção antes de
+// apagar — `count(*) = 0`, `count(referencia) = 0`.
+//
+// Ela não era só peso morto; era armadilha. O campo `referencia` era INDEXADO e
+// o próprio comentário dizia que guardaria "cpf, importacaoId, etc.", e havia um
+// `payload Json?` onde CPF e nome caberiam sem restrição. A rotina de exclusão
+// do titular enumera as tabelas UMA A UMA e não incluía esta. Bastava alguém
+// começar a usar a fila "que já existe" para que um pedido de exclusão passasse
+// a deixar CPF para trás, indexado, sem nada denunciar.
+//
+// Quem for reintroduzir fila em banco: o identificador do job não pode ser o CPF
+// em claro, e a tabela precisa entrar em `TitularService.excluir` no mesmo commit.
+
+/// Agregação diária do consumo da API — base do "controle de consumo".
+model ApiUsage {
+  id       String   @id @default(uuid()) @db.Uuid
+  provider String   @default("CONTACTRA")
+  data     DateTime @db.Date
+
+  chamadas        Int     @default(0)
+  sucesso         Int     @default(0)
+  semDados        Int     @default(0)
+  erros           Int     @default(0)
+  creditosGastos  Decimal @default(0) @db.Decimal(12, 4)
+  latenciaMediaMs Int?
+
+  editadoEm DateTime @updatedAt
+
+  @@unique([provider, data])
+  @@index([data(sort: Desc)])
+  @@map("api_usage")
+}
+
+/// Retrato diário dos indicadores da carteira, por lote (tribunal + exercício).
+///
+/// Existe para as TENDÊNCIAS: com um snapshot por dia, os KPIs do dashboard
+/// ganham histórico real ao longo do tempo — o sparkline nasce vazio e enche a
+/// cada dia. Gravado de forma idempotente, um por (organização, lote, dia), então
+/// abrir o dashboard várias vezes no mesmo dia não duplica nada (ON CONFLICT DO
+/// NOTHING via createMany skipDuplicates).
+model SnapshotCarteira {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  tribunalId     String   @db.Uuid
+  exercicio      Int
+  data           DateTime @db.Date
+
+  processos       Int
+  pessoas         Int
+  comAlgumContato Int
+  valorTotal      Decimal @db.Decimal(18, 2)
+  valorAlcancavel Decimal @db.Decimal(18, 2)
+
+  criadoEm DateTime @default(now())
+
+  @@unique([organizationId, tribunalId, exercicio, data])
+  @@map("snapshots_carteira")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AUDITORIA E LGPD
+// ═══════════════════════════════════════════════════════════════════
+
+model AuditLog {
+  id             String  @id @default(uuid()) @db.Uuid
+  organizationId String? @db.Uuid
+  userId         String? @db.Uuid
+
+  acao        String // LOGIN, IMPORTAR, SINCRONIZAR, EXPORTAR, EXCLUIR...
+  entidade    String?
+  entidadeId  String?
+  ip          String?
+  userAgent   String?
+  dadosAntes  Json?
+  dadosDepois Json?
+
+  criadoEm DateTime @default(now())
+
+  organization Organization? @relation(fields: [organizationId], references: [id])
+  user         User?         @relation(fields: [userId], references: [id])
+
+  @@index([organizationId, criadoEm(sort: Desc)])
+  @@index([userId, criadoEm(sort: Desc)])
+  @@index([acao, criadoEm(sort: Desc)])
+  @@map("audit_logs")
+}
+
+/// Registra QUEM consultou O QUÊ. É o que responde, numa fiscalização,
+/// "quem acessou os dados deste titular e quando".
+/// Obrigatório para a política de contato completo — é a trilha que sustenta o acesso.
+model ConsultaCliente {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+
+  tipo            String // CPF | NOME | PROCESSO | CIDADE | UF
+  /// O texto CRU que o operador digitou — e o único campo livre desta trilha.
+  ///
+  /// Pode conter nome completo e, em busca por endereço, logradouro. Vive por
+  /// `RETENCAO_TERMO_BUSCA_DIAS` e depois vira NULL na retenção agendada; o que
+  /// sustenta a prestação de contas — QUEM consultou, QUANDO, QUAL CPF, quantos
+  /// resultados, se o contato foi exibido — não tem prazo e continua inteiro.
+  ///
+  /// NULO significa "existiu um termo aqui, o conteúdo foi descartado no prazo",
+  /// e não "buscou vazio": a linha só é criada quando há termo.
+  termo           String?
+  /// CPF consultado, quando aplicável — permite responder ao titular.
+  cpfConsultado   String? @db.VarChar(11)
+  totalResultados Int     @default(0)
+  /// Marca se o contato (telefone/e-mail/endereço) foi efetivamente exibido.
+  contatoExibido  Boolean @default(false)
+
+  ip        String?
+  userAgent String?
+  criadoEm  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, criadoEm(sort: Desc)])
+  @@index([cpfConsultado])
+  @@index([criadoEm(sort: Desc)])
+  @@map("consultas_cliente")
+}
+
+enum TipoSolicitacaoTitular {
+  ACESSO
+  CORRECAO
+  EXCLUSAO
+  OPOSICAO
+  PORTABILIDADE
+  REVISAO_AUTOMATIZADA
+}
+
+enum StatusSolicitacaoTitular {
+  RECEBIDA
+  EM_ANALISE
+  ATENDIDA
+  RECUSADA
+}
+
+/// Direitos do titular (LGPD art. 18). Existe desde a etapa 1 porque
+/// acrescentar depois custa caro e o prazo legal de resposta é curto.
+model SolicitacaoTitular {
+  id        String                   @id @default(uuid()) @db.Uuid
+  protocolo String                   @unique
+  cpf       String                   @db.VarChar(11)
+  nome      String?
+  email     String?
+  tipo      TipoSolicitacaoTitular
+  status    StatusSolicitacaoTitular @default(RECEBIDA)
+
+  descricao   String?
+  resposta    String?
+  prazoLimite DateTime?
+
+  recebidoEm   DateTime  @default(now())
+  respondidoEm DateTime?
+
+  @@index([cpf])
+  @@index([status, prazoLimite])
+  @@map("solicitacoes_titular")
+}

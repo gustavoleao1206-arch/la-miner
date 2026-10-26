@@ -1,0 +1,54 @@
+# Segredos — nunca versionar
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Saída de scripts que contém credencial (ex.: perfis-de-teste.local.md, com a
+# senha dos usuários de teste). O sufixo é `.local.` para a regra pegar qualquer
+# arquivo desse tipo criado depois, sem alguém precisar lembrar de vir aqui.
+*.local.md
+
+# Dependências
+node_modules/
+.pnp.*
+
+# Build
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Prisma
+packages/database/generated/
+
+# Uploads e dados locais
+uploads/
+tmp/
+*.xlsx
+*.csv
+!docs/**/*.csv
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Testes
+coverage/
+
+# Editor / SO
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Dumps do banco — contêm a base INTEIRA: nome, CPF, telefone, e-mail e endereço
+# de milhares de titulares reais. Uma vez no histórico do git, dado pessoal não
+# sai mais (e um pedido de exclusão do art. 18 da LGPD não alcança commit).
+backups/
+*.dump
+*.sql.gz

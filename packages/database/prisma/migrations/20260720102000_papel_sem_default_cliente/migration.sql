@@ -1,0 +1,11 @@
+-- Remove o default CLIENTE da coluna de papel.
+--
+-- Com @default(CLIENTE) e o RolesGuard liberando rota sem @Papeis declarados,
+-- todo usuário criado sem papel explícito nascia com acesso de leitura à
+-- carteira inteira. O guard já passou a negar por omissão; aqui o papel deixa
+-- de ter valor presumido. Linhas existentes não são tocadas.
+--
+-- NÃO inclui os DROP INDEX que `prisma migrate diff` sugere: os índices
+-- trigram vêm de migration SQL bruta e não existem no schema Prisma, então
+-- ele os interpreta como sobra. Derrubá-los degradaria a busca por nome e CPF.
+ALTER TABLE "users" ALTER COLUMN "papel" DROP DEFAULT;

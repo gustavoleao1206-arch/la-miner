@@ -1,0 +1,44 @@
+{
+  "name": "leao-amorim-miner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sistema de Inteligência de Precatórios — Leão Amorim",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "//postinstall": "O Prisma Client é gerado, não versionado (packages/database/generated/ está no .gitignore). Sem este passo, um clone limpo — inclusive o do build da Render — não compila: os tipos do @miner/database não existem.",
+    "postinstall": "npm run db:generate",
+    "build": "npm run build:api && npm run build:web",
+    "build:api": "npm run build -w @miner/api",
+    "build:web": "npm run build -w @miner/web",
+    "start:api": "node apps/api/dist/main.js",
+    "//start:worker": "Mesmo build da API — o `nest build` compila os dois pontos de entrada, porque main.worker.ts está sob src/. Não há artefato separado a manter.",
+    "start:worker": "node apps/api/dist/main.worker.js",
+    "start:web": "npm run start -w @miner/web",
+    "typecheck": "tsc --noEmit -p apps/api/tsconfig.json && tsc --noEmit -p apps/web/tsconfig.json",
+    "test": "npm run test -w @miner/api && npm run test -w @miner/web",
+    "test:int": "npm run test:int -w @miner/api",
+    "//audit:prod": "Portão de vulnerabilidades com aceites NOMEADOS. O npm audit cru saía com erro em todo push por causa de UM aviso já investigado e aceito por escrito (js-yaml via @nestjs/swagger, resolvido em 17/08/2026 pelo bump para a 11.4.7) — e portão permanentemente vermelho é pior que portão nenhum: ensina a equipe a ignorar o sinal, e a vulnerabilidade de verdade chega no meio do ruído. O script deixa passar o que já foi decidido e reprova todo o resto.",
+    "audit:prod": "node scripts/auditoria-producao.js",
+    "db:generate": "npm run generate -w @miner/database",
+    "db:migrate": "npm run migrate -w @miner/database",
+    "db:migrate:deploy": "npm run migrate:deploy -w @miner/database",
+    "db:studio": "npm run studio -w @miner/database",
+    "db:seed": "npm run seed -w @miner/database",
+    "//perfis:teste": "Provisiona os perfis de cliente para teste (um por estado de assinatura). Depende do build da API: as carteiras saem do DistribuicaoService de verdade, e não de INSERT à mão.",
+    "perfis:teste": "npm run build:api && node apps/api/scripts/perfis-de-teste.js",
+    "perfis:teste:remover": "node apps/api/scripts/perfis-de-teste.js --remover --sim",
+    "infra:up": "docker compose -f docker/docker-compose.dev.yml up -d",
+    "infra:down": "docker compose -f docker/docker-compose.dev.yml down",
+    "infra:logs": "docker compose -f docker/docker-compose.dev.yml logs -f"
+  },
+  "//overrides": "multer 2.5.0 e' o unico jeito: @nestjs/platform-express fixa o multer em versao EXATA (a 11.2.8, ultima da linha 11, e a 12.2.0 fixam 2.4.0), e tudo abaixo de 2.5.0 carrega GHSA-q7qp-rjg7-q26m (negacao de servico com fileFilter assincrono pendente). Sem override o portao audit:prod fica vermelho e o CI nunca chega no passo que publica. O PAR IMPORTA: do multer 2.4.0 em diante a mensagem 'Unexpected field' virou 'Unexpected file field', e o @nestjs/platform-express so reconhece o erro pelo code a partir da 11.2.6. Com o Nest abaixo disso, arquivo em campo inesperado responde 500 em vez de 400 (coberto por apps/api/test/integracao/importacao-upload-http.int-spec.ts). Revisar quando o NestJS soltar versao que ja aponte para 2.5.0.",
+  "overrides": {
+    "multer": "2.5.0"
+  }
+}
